@@ -1,0 +1,183 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <SoftwareSerial.h>
+
+// ESP32 GPIO17 (TX2) -> Arduino UNO D2 (RX)
+SoftwareSerial esp32(2, 3);
+
+LiquidCrystal_I2C lcd27(0x27, 16, 2);
+LiquidCrystal_I2C lcd3F(0x3F, 16, 2);
+LiquidCrystal_I2C* lcd = nullptr;
+
+// Caracteres personalizados para la pantalla LCD 16x2.
+// En UTF-8, '¿' y 'á' ocupan 2 bytes, pero en la LCD deben usar 1 celda.
+byte signoPreguntaApertura[8] = {
+  B00100,
+  B00000,
+  B00100,
+  B01000,
+  B10000,
+  B10001,
+  B01110,
+  B00000
+};
+
+byte letraAConTilde[8] = {
+  B00010,
+  B00100,
+  B01110,
+  B00001,
+  B01111,
+  B10001,
+  B01111,
+  B00000
+};
+
+uint8_t detectarLCD() {
+  Serial.println("Buscando dispositivos I2C...");
+
+  for (uint8_t direccion = 1; direccion < 127; direccion++) {
+    Wire.beginTransmission(direccion);
+    uint8_t resultado = Wire.endTransmission();
+
+    if (resultado == 0) {
+      Serial.print("Dispositivo encontrado: 0x");
+      if (direccion < 16) Serial.print("0");
+      Serial.println(direccion, HEX);
+
+      if (direccion == 0x27 || direccion == 0x3F) {
+        return direccion;
+      }
+    }
+  }
+  return 0;
+}
+
+// Dibuja una linea en un maximo de 16 celdas.
+// Interpreta los caracteres especiales sin cortar a la mitad un UTF-8.
+// Sobrescribe toda la linea con espacios finales para que no parpadee.
+void imprimirLinea(uint8_t fila, const String& texto) {
+  if (lcd == nullptr) return;
+
+  lcd->setCursor(0, fila);
+  uint8_t celdas = 0;
+
+  for (unsigned int i = 0; i < texto.length() && celdas < 16; ++i) {
+    uint8_t actual = (uint8_t)texto[i];
+
+    if (actual == 0xC2 && i + 1 < texto.length()) {
+      uint8_t siguiente = (uint8_t)texto[i + 1];
+      if (siguiente == 0xBF) { // ¿
+        lcd->write((uint8_t)0);
+        ++i;
+        ++celdas;
+        continue;
+      }
+    }
+
+    if (actual == 0xC3 && i + 1 < texto.length()) {
+      uint8_t siguiente = (uint8_t)texto[i + 1];
+      if (siguiente == 0xA1) { // á
+        lcd->write((uint8_t)1);
+        ++i;
+        ++celdas;
+        continue;
+      }
+
+      // Otros acentos que puedan aparecer en futuros nombres o mensajes.
+      // Por ahora se muestran sin tilde para no ocupar mas caracteres personalizados.
+      char sinTilde = 0;
+      switch (siguiente) {
+        case 0xA9: sinTilde = 'e'; break; // é
+        case 0xAD: sinTilde = 'i'; break; // í
+        case 0xB3: sinTilde = 'o'; break; // ó
+        case 0xBA: sinTilde = 'u'; break; // ú
+        case 0xB1: sinTilde = 'n'; break; // ñ
+        case 0x81: sinTilde = 'A'; break; // Á
+        case 0x89: sinTilde = 'E'; break; // É
+        case 0x8D: sinTilde = 'I'; break; // Í
+        case 0x93: sinTilde = 'O'; break; // Ó
+        case 0x9A: sinTilde = 'U'; break; // Ú
+        case 0x91: sinTilde = 'N'; break; // Ñ
+        default: sinTilde = '?'; break;
+      }
+      lcd->write((uint8_t)sinTilde);
+      ++i;
+      ++celdas;
+      continue;
+    }
+
+    // Cualquier caracter UTF-8 no conocido: mostrar ? en lugar de simbolos raros.
+    if (actual >= 0x80) {
+      if ((actual & 0xC0) != 0x80) {
+        lcd->write((uint8_t)'?');
+        ++celdas;
+      }
+      continue;
+    }
+
+    lcd->write(actual);
+    ++celdas;
+  }
+
+  while (celdas < 16) {
+    lcd->write((uint8_t)' ');
+    ++celdas;
+  }
+}
+
+void mostrarMensaje(String mensaje) {
+  if (lcd == nullptr) return;
+
+  int separador = mensaje.indexOf('|');
+  if (separador == -1) return;
+
+  String linea1 = mensaje.substring(0, separador);
+  String linea2 = mensaje.substring(separador + 1);
+
+  // No usamos lcd->clear() cada vez: eso evitara el parpadeo al contar.
+  imprimirLinea(0, linea1);
+  imprimirLinea(1, linea2);
+}
+
+void setup() {
+  Serial.begin(115200);
+  esp32.begin(9600);
+  Wire.begin();
+
+  delay(500);
+  Serial.println("=== LavaRESI - UNO LCD ===");
+
+  uint8_t direccion = detectarLCD();
+  if (direccion == 0x27) {
+    lcd = &lcd27;
+  } else if (direccion == 0x3F) {
+    lcd = &lcd3F;
+  }
+
+  if (lcd == nullptr) {
+    Serial.println("ERROR: LCD I2C no detectada");
+    Serial.println("Revisar SDA, SCL, VCC y GND");
+    return;
+  }
+
+  lcd->init();
+  lcd->backlight();
+  lcd->createChar(0, signoPreguntaApertura);
+  lcd->createChar(1, letraAConTilde);
+  lcd->clear();
+
+  imprimirLinea(0, "LavaRESI");
+  imprimirLinea(1, "LCD detectada");
+
+  Serial.println("LCD inicializada correctamente");
+}
+
+void loop() {
+  if (esp32.available()) {
+    String mensaje = esp32.readStringUntil('\n');
+    mensaje.trim();
+    Serial.println(mensaje);
+    mostrarMensaje(mensaje);
+  }
+}

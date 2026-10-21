@@ -1,0 +1,814 @@
+#include <Arduino.h>
+#include <IRremote.hpp>
+
+// LavaRESI - ESP32, etapa 1: menu, tandas y consultas locales.
+// Se conserva el cableado ORIGINAL. El UNO continua recibiendo: linea1|linea2
+// IMPORTANTE: Usuarios y colas son SOLO DE DEMOSTRACION; no hay Wi-Fi,
+// base de datos, notificaciones ni Prolog conectados todavia.
+
+#define JOY_X 32
+#define JOY_Y 35
+#define JOY_SW 25
+#define IR_PIN 34
+
+#define LED_L_VERDE 18
+#define LED_L_ROJO 19
+#define LED_L_AMARILLO 21
+#define LED_S_VERDE 22
+#define LED_S_ROJO 23
+#define LED_S_AMARILLO 13
+#define BUZZER_PIN 26
+
+const uint8_t LEDS[2][3] = {
+  {LED_L_VERDE, LED_L_ROJO, LED_L_AMARILLO},
+  {LED_S_VERDE, LED_S_ROJO, LED_S_AMARILLO}
+};
+
+// Codigos del control remoto que ya funcionaron en LavaRESI.
+const uint8_t IR_ARRIBA = 0x09;
+const uint8_t IR_ABAJO = 0x07;
+const uint8_t IR_IZQUIERDA = 0x44;
+const uint8_t IR_DERECHA = 0x43;
+const uint8_t IR_FUNC_STOP = 0x47;
+const uint8_t IR_PLAY_OK = 0x40;
+
+const uint8_t MAX_TANDAS = 3;
+const uint8_t MAX_SOLICITUDES = 8;
+
+// Cuentas ficticias, para verificar varias posiciones de cola SIN backend.
+// No usar estos PIN en produccion: deberan venir de la base de datos.
+struct UsuarioDemo {
+  const char *nombre;
+  const char *pin;
+  bool disponible;
+};
+UsuarioDemo usuarios[] = {
+  {"Melissa", "1234", true},
+  {"Kelvin",  "2345", true},
+  {"Andy",    "3456", true},
+  {"Andrei",  "4567", true}
+};
+const uint8_t NUM_USUARIOS = sizeof(usuarios) / sizeof(usuarios[0]);
+
+// 0/N cuando aun no ha iniciado; 1/N al INICIAR la primera tanda, etc.
+struct Solicitud {
+  int usuario;
+  uint8_t total;
+  uint8_t iniciadas;
+};
+Solicitud colas[2][MAX_SOLICITUDES];
+uint8_t cantidadCola[2] = {0, 0};
+
+enum EstadoEquipo { LIBRE, EN_USO, TERMINADO, PREPARANDO };
+struct Equipo {
+  EstadoEquipo estado = LIBRE;
+  int dueno = -1;   // Indice de la cuenta propietaria del turno actual.
+  unsigned long restantes = 0;
+  unsigned long ultimoTick = 0;
+};
+Equipo equipos[2]; // 0 lavadora; 1 secadora.
+
+enum Pantalla {
+  MENU,
+  EQUIPO,
+  PIN_EQUIPO,
+  TANDAS,
+  TIEMPO,
+  MENU_CONSULTAS,
+  COLA_CONSULTA,
+  PIN_MI_TURNO,
+  VER_MI_TURNO,
+  AVISO
+};
+Pantalla pantalla = MENU;
+Pantalla despuesAviso = MENU;
+unsigned long avisoHasta = 0;
+
+uint8_t opcionMenu = 0;       // 0 lavadora, 1 secadora, 2 consultas.
+uint8_t maquina = 0;         // Maquina seleccionada cuando entramos a ella.
+uint8_t opcionConsulta = 0;   // 0 cola lavadora, 1 cola secadora, 2 mi turno.
+uint8_t maquinaConsulta = 0;  // Para recorrer o consultar colas.
+uint8_t desplazamientoCola = 0;
+int usuarioActual = -1;
+uint8_t tandasElegidas = 1;
+String entrada = "";
+
+bool joyVerticalActivo = false;
+bool joyHorizontalActivo = false;
+bool botonAnterior = HIGH;
+unsigned long ultimoBoton = 0;
+
+// -------------------- BUZZER NO BLOQUEANTE --------------------
+uint8_t pitidosPendientes = 0;
+bool buzzerEncendido = false;
+unsigned long cambioBuzzer = 0;
+const unsigned long DURACION_PITIDO_MS = 150;
+const unsigned long PAUSA_PITIDO_MS = 140;
+
+void iniciarPitidos(uint8_t cantidad) {
+  if (cantidad == 0) return;
+  if (buzzerEncendido || pitidosPendientes > 0) {
+    if (cantidad > pitidosPendientes) pitidosPendientes = cantidad;
+    return;
+  }
+  pitidosPendientes = cantidad;
+  buzzerEncendido = true;
+  digitalWrite(BUZZER_PIN, HIGH);
+  cambioBuzzer = millis();
+}
+
+void actualizarBuzzer() {
+  if (pitidosPendientes == 0) return;
+  unsigned long ahora = millis();
+  if (buzzerEncendido) {
+    if (ahora - cambioBuzzer >= DURACION_PITIDO_MS) {
+      digitalWrite(BUZZER_PIN, LOW);
+      buzzerEncendido = false;
+      cambioBuzzer = ahora;
+      --pitidosPendientes;
+    }
+  } else if (ahora - cambioBuzzer >= PAUSA_PITIDO_MS) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    buzzerEncendido = true;
+    cambioBuzzer = ahora;
+  }
+}
+
+// -------------------- LED DE AMBAS MAQUINAS --------------------
+void actualizarLeds() {
+  for (int i = 0; i < 2; i++) {
+    EstadoEquipo estado = equipos[i].estado;
+    digitalWrite(LEDS[i][0], estado == LIBRE ? HIGH : LOW);
+    // En PREPARANDO la maquina sigue reservada para la siguiente tanda.
+    digitalWrite(LEDS[i][1], (estado == EN_USO || estado == PREPARANDO) ? HIGH : LOW);
+    digitalWrite(LEDS[i][2], estado == TERMINADO ? HIGH : LOW);
+  }
+}
+
+void prepararYProbarLeds() {
+  for (int i = 0; i < 2; i++) {
+    for (int j = 0; j < 3; j++) {
+      digitalWrite(LEDS[i][j], LOW);
+      pinMode(LEDS[i][j], OUTPUT);
+    }
+  }
+  for (int i = 0; i < 2; i++) {
+    for (int j = 0; j < 3; j++) {
+      digitalWrite(LEDS[i][j], HIGH);
+      delay(250);
+      digitalWrite(LEDS[i][j], LOW);
+      delay(100);
+    }
+  }
+  actualizarLeds();
+}
+
+// -------------------- LCD / SERIAL2 A UNO --------------------
+void lcdEnviar(const String &linea1, const String &linea2) {
+  static String anterior1 = "";
+  static String anterior2 = "";
+  if (linea1 == anterior1 && linea2 == anterior2) return;
+  anterior1 = linea1;
+  anterior2 = linea2;
+  Serial2.println(linea1 + "|" + linea2);
+  Serial.println("LCD: " + linea1 + " | " + linea2);
+}
+
+String formatoTiempo(unsigned long segundos) {
+  char texto[13];
+  snprintf(texto, sizeof(texto), "%02lu:%02lu", segundos / 60UL, segundos % 60UL);
+  return String(texto);
+}
+
+String nombreUsuario(int id) {
+  return (id >= 0 && id < NUM_USUARIOS) ? String(usuarios[id].nombre) : String("Usuario");
+}
+
+String etiquetaMaquina(int m) { return m == 0 ? "L" : "S"; }
+
+// -------------------- COLAS INDEPENDIENTES --------------------
+int buscarSolicitud(int m, int usuario) {
+  for (int i = 0; i < cantidadCola[m]; i++) {
+    if (colas[m][i].usuario == usuario) return i;
+  }
+  return -1;
+}
+
+int agregarSolicitud(int m, int usuario, uint8_t tandas) {
+  int existente = buscarSolicitud(m, usuario);
+  if (existente >= 0) return existente;  // Evitar duplicados.
+  if (cantidadCola[m] >= MAX_SOLICITUDES) return -1;
+  int indice = cantidadCola[m]++;
+  colas[m][indice] = {usuario, tandas, 0};
+  return indice;
+}
+
+void borrarSolicitud(int m, int indice) {
+  if (indice < 0 || indice >= cantidadCola[m]) return;
+  for (int i = indice; i + 1 < cantidadCola[m]; i++) {
+    colas[m][i] = colas[m][i + 1];
+  }
+  cantidadCola[m]--;
+}
+
+// Una ausencia permite saltar a quien no esta disponible, sin borrar
+// su solicitud ni alterar su antiguedad.
+int primeraSolicitudDisponible(int m) {
+  for (int i = 0; i < cantidadCola[m]; i++) {
+    int u = colas[m][i].usuario;
+    if (usuarios[u].disponible) return i;
+  }
+  return -1;
+}
+
+// Consulta LCD: ocupante en primer lugar, seguidos de todos los demas.
+// Se incluyen no disponibles: la web mostrara esa condicion en detalle.
+int indiceVisible(int m, int posicion) {
+  int dueno = equipos[m].dueno;
+  int idxDueno = buscarSolicitud(m, dueno);
+  if (idxDueno >= 0) {
+    if (posicion == 0) return idxDueno;
+    int vistos = 1;
+    for (int i = 0; i < cantidadCola[m]; i++) {
+      if (i == idxDueno) continue;
+      if (vistos == posicion) return i;
+      vistos++;
+    }
+    return -1;
+  }
+  return posicion < cantidadCola[m] ? posicion : -1;
+}
+
+int puestoVisible(int m, int usuario) {
+  for (int i = 0; i < cantidadCola[m]; i++) {
+    int idx = indiceVisible(m, i);
+    if (idx >= 0 && colas[m][idx].usuario == usuario) return i + 1;
+  }
+  return -1;
+}
+
+String textoTandas(int m, int idx) {
+  return String(colas[m][idx].iniciadas) + "/" + String(colas[m][idx].total);
+}
+
+// -------------------- PANTALLAS --------------------
+const char *opcionesMenu[3] = {"Lavadora", "Secadora", "Consultas"};
+const char *opcionesConsultas[3] = {"Cola Lavadora", "Cola Secadora", "Mi turno"};
+
+void mostrarVista() {
+  String a, b;
+  switch (pantalla) {
+    case MENU: {
+      int inicio = opcionMenu == 0 ? 0 : 1; // Scroll de dos filas.
+      a = String(opcionMenu == inicio ? ">" : " ") + String(inicio + 1) + " " + opcionesMenu[inicio];
+      b = String(opcionMenu == inicio + 1 ? ">" : " ") + String(inicio + 2) + " " + opcionesMenu[inicio + 1];
+      break;
+    }
+    case EQUIPO: {
+      Equipo &e = equipos[maquina];
+      String sigla = etiquetaMaquina(maquina);
+      if (e.estado == LIBRE) {
+        a = sigla + " Disponible";
+        b = cantidadCola[maquina] == 0 ? "OK: Ingresar PIN" : "OK: Ver turno";
+      } else {
+        int idx = buscarSolicitud(maquina, e.dueno);
+        String persona = nombreUsuario(e.dueno);
+        String progreso = idx >= 0 ? textoTandas(maquina, idx) : "-/-";
+        if (e.estado == EN_USO) {
+          a = sigla + " " + persona + " " + progreso;
+          b = "T: " + formatoTiempo(e.restantes);
+        } else if (e.estado == TERMINADO) {
+          a = sigla + " " + persona + " FIN";
+          b = "OK: PIN retiro";
+        } else {
+          a = sigla + " " + persona + " " + progreso;
+          b = "OK: Sig. tanda";
+        }
+      }
+      break;
+    }
+    case PIN_EQUIPO:
+    case PIN_MI_TURNO: {
+      a = pantalla == PIN_EQUIPO ? "Ingrese su PIN" : "Mi turno";
+      b = "PIN: ";
+      for (unsigned int i = 0; i < entrada.length(); i++) b += "*";
+      break;
+    }
+    case TANDAS: {
+      // Texto exacto acordado. El UNO debe mapear los caracteres UTF-8
+      // '¿' y 'á' a glifos del LCD; revisar su sketch para esos 2 simbolos.
+      a = "¿Cuántas tandas";
+      b = nombreUsuario(usuarioActual) + "? " + String(tandasElegidas);
+      break;
+    }
+    case TIEMPO: {
+      int idx = buscarSolicitud(maquina, usuarioActual);
+      int siguiente = idx >= 0 ? colas[maquina][idx].iniciadas + 1 : 1;
+      int total = idx >= 0 ? colas[maquina][idx].total : 1;
+      a = etiquetaMaquina(maquina) + " " + nombreUsuario(usuarioActual) + " " + String(siguiente) + "/" + String(total);
+      b = "Min: " + (entrada.length() ? entrada : String("--")) + "  OK";
+      break;
+    }
+    case MENU_CONSULTAS: {
+      int inicio = opcionConsulta == 0 ? 0 : 1;
+      a = String(opcionConsulta == inicio ? ">" : " ") + String(inicio + 1) + " " + opcionesConsultas[inicio];
+      b = String(opcionConsulta == inicio + 1 ? ">" : " ") + String(inicio + 2) + " " + opcionesConsultas[inicio + 1];
+      break;
+    }
+    case COLA_CONSULTA: {
+      int n = cantidadCola[maquinaConsulta];
+      if (n == 0) {
+        a = maquinaConsulta == 0 ? "Cola Lavadora" : "Cola Secadora";
+        b = "Sin espera";
+      } else {
+        int pos1 = desplazamientoCola;
+        int idx1 = indiceVisible(maquinaConsulta, pos1);
+        if (idx1 >= 0) {
+          a = String(pos1 + 1) + " " + nombreUsuario(colas[maquinaConsulta][idx1].usuario) +
+              " " + textoTandas(maquinaConsulta, idx1);
+        }
+        int pos2 = pos1 + 1;
+        int idx2 = indiceVisible(maquinaConsulta, pos2);
+        if (idx2 >= 0) {
+          b = String(pos2 + 1) + " " + nombreUsuario(colas[maquinaConsulta][idx2].usuario) +
+              " " + textoTandas(maquinaConsulta, idx2);
+        } else {
+          b = "Fin de cola";
+        }
+      }
+      break;
+    }
+    case VER_MI_TURNO: {
+      int idx = buscarSolicitud(maquinaConsulta, usuarioActual);
+      a = etiquetaMaquina(maquinaConsulta) + " Mi turno";
+      if (idx < 0) {
+        b = "Sin solicitud";
+      } else {
+        bool soyDueno = equipos[maquinaConsulta].dueno == usuarioActual;
+        if (soyDueno) {
+          b = "En uso " + textoTandas(maquinaConsulta, idx);
+        } else {
+          b = "Puesto " + String(puestoVisible(maquinaConsulta, usuarioActual)) +
+              " " + textoTandas(maquinaConsulta, idx);
+        }
+      }
+      break;
+    }
+    case AVISO:
+      return; // Conservar el mensaje hasta que pase el tiempo.
+  }
+  lcdEnviar(a, b);
+}
+
+void irMenu() {
+  pantalla = MENU;
+  entrada = "";
+  mostrarVista();
+}
+
+void irEquipo() {
+  pantalla = EQUIPO;
+  entrada = "";
+  mostrarVista();
+}
+
+void pedirPin(Pantalla destino) {
+  pantalla = destino;
+  entrada = "";
+  mostrarVista();
+}
+
+void pedirTiempo() {
+  pantalla = TIEMPO;
+  entrada = "";
+  mostrarVista();
+}
+
+void avisar(const String &a, const String &b, Pantalla siguiente, unsigned long ms = 1300) {
+  despuesAviso = siguiente;
+  pantalla = AVISO;
+  avisoHasta = millis() + ms;
+  lcdEnviar(a, b);
+}
+
+void actualizarAviso() {
+  if (pantalla != AVISO) return;
+  if ((long)(millis() - avisoHasta) >= 0) {
+    pantalla = despuesAviso;
+    mostrarVista();
+  }
+}
+
+// -------------------- INICIO Y RETIRO DE TANDAS --------------------
+void iniciarCiclo(unsigned int minutos) {
+  int idx = buscarSolicitud(maquina, usuarioActual);
+  if (idx < 0) {
+    avisar("Sin solicitud", "Registre turno", EQUIPO);
+    return;
+  }
+  Equipo &e = equipos[maquina];
+  if (colas[maquina][idx].iniciadas >= colas[maquina][idx].total) {
+    avisar("Sin tandas", "pendientes", EQUIPO);
+    return;
+  }
+  if (e.estado == LIBRE) {
+    if (primeraSolicitudDisponible(maquina) != idx) {
+      avisar("Aun no es turno", "Revise la cola", EQUIPO);
+      return;
+    }
+    e.dueno = usuarioActual;
+  } else if (!(e.estado == PREPARANDO && e.dueno == usuarioActual)) {
+    avisar("Equipo ocupado", "Espere turno", EQUIPO);
+    return;
+  }
+  colas[maquina][idx].iniciadas++;
+  e.estado = EN_USO;
+  e.restantes = (unsigned long)minutos * 60UL;
+  e.ultimoTick = millis();
+  actualizarLeds();
+  iniciarPitidos(1);
+  Serial.println("Inicio " + etiquetaMaquina(maquina) + " / " + nombreUsuario(usuarioActual) +
+                 " / tanda " + textoTandas(maquina, idx));
+  irEquipo();
+}
+
+void confirmarRetiro(int usuario) {
+  Equipo &e = equipos[maquina];
+  if (e.estado != TERMINADO || e.dueno != usuario) {
+    avisar("Retiro denegado", "Sin autorizacion", EQUIPO);
+    return;
+  }
+  int idx = buscarSolicitud(maquina, usuario);
+  if (idx < 0) {
+    avisar("Error de turno", "Revise solicitud", EQUIPO);
+    return;
+  }
+  e.restantes = 0;
+  iniciarPitidos(1);
+  if (colas[maquina][idx].iniciadas < colas[maquina][idx].total) {
+    // Tanda intermedia: el dueno retiene la maquina y coloca la siguiente.
+    e.estado = PREPARANDO;
+    actualizarLeds();
+    avisar("Tanda retirada", "Sigue otra tanda", TIEMPO, 1450);
+  } else {
+    // SOLO el ultimo retiro libera realmente la maquina.
+    borrarSolicitud(maquina, idx);
+    e.estado = LIBRE;
+    e.dueno = -1;
+    actualizarLeds();
+    avisar("Ropa retirada", "Equipo libre", MENU, 1450);
+  }
+}
+
+void procesarPinEquipo() {
+  int id = -1;
+  for (int i = 0; i < NUM_USUARIOS; i++) {
+    if (entrada == usuarios[i].pin) { id = i; break; }
+  }
+  if (id < 0) {
+    avisar("PIN incorrecto", "Intente otra vez", PIN_EQUIPO);
+    entrada = "";
+    return;
+  }
+  usuarioActual = id;
+  entrada = "";
+  Equipo &e = equipos[maquina];
+  int idx = buscarSolicitud(maquina, id);
+
+  if (e.dueno == id) {
+    if (e.estado == TERMINADO) {
+      confirmarRetiro(id); // PIN del propietario confirmado.
+    } else if (e.estado == PREPARANDO) {
+      pedirTiempo();
+    } else {
+      avisar("Ciclo en marcha", "Consulte tiempo", EQUIPO);
+    }
+    return;
+  }
+
+  if (idx < 0) {
+    tandasElegidas = 1;
+    pantalla = TANDAS;
+    mostrarVista();
+    return;
+  }
+  if (e.estado == LIBRE && primeraSolicitudDisponible(maquina) == idx) {
+    pedirTiempo();
+  } else {
+    avisar("Turno registrado", "Puesto: " + String(puestoVisible(maquina, id)), EQUIPO, 1600);
+  }
+}
+
+void procesarPinMiTurno() {
+  int id = -1;
+  for (int i = 0; i < NUM_USUARIOS; i++) {
+    if (entrada == usuarios[i].pin) { id = i; break; }
+  }
+  if (id < 0) {
+    avisar("PIN incorrecto", "Intente otra vez", PIN_MI_TURNO);
+    entrada = "";
+    return;
+  }
+  usuarioActual = id;
+  maquinaConsulta = 0;
+  entrada = "";
+  pantalla = VER_MI_TURNO;
+  mostrarVista();
+}
+
+void registrarTandas() {
+  int idx = agregarSolicitud(maquina, usuarioActual, tandasElegidas);
+  if (idx < 0) {
+    avisar("Cola completa", "Intente despues", EQUIPO);
+    return;
+  }
+  Serial.println("Solicitud demo: " + etiquetaMaquina(maquina) + ", " +
+                 nombreUsuario(usuarioActual) + ", " + String(tandasElegidas) + " tandas");
+  if (equipos[maquina].estado == LIBRE && primeraSolicitudDisponible(maquina) == idx) {
+    pedirTiempo();
+  } else {
+    avisar("Turno registrado", "Puesto: " + String(puestoVisible(maquina, usuarioActual)), EQUIPO, 1650);
+  }
+}
+
+// -------------------- ENTRADAS Y NAVEGACION --------------------
+void abrirConsulta() {
+  if (opcionConsulta == 0 || opcionConsulta == 1) {
+    maquinaConsulta = opcionConsulta;
+    desplazamientoCola = 0;
+    pantalla = COLA_CONSULTA;
+    mostrarVista();
+  } else {
+    pedirPin(PIN_MI_TURNO);
+  }
+}
+
+void confirmar() {
+  if (pantalla == AVISO) return;
+  switch (pantalla) {
+    case MENU:
+      if (opcionMenu < 2) {
+        maquina = opcionMenu;
+        irEquipo();
+      } else {
+        pantalla = MENU_CONSULTAS;
+        opcionConsulta = 0;
+        mostrarVista();
+      }
+      break;
+    case EQUIPO:
+      pedirPin(PIN_EQUIPO);
+      break;
+    case PIN_EQUIPO:
+      procesarPinEquipo();
+      break;
+    case TANDAS:
+      registrarTandas();
+      break;
+    case TIEMPO: {
+      int minutos = entrada.toInt();
+      if (minutos < 1 || minutos > 180) {
+        entrada = "";
+        avisar("Tiempo invalido", "Ingrese 1-180", TIEMPO);
+      } else {
+        iniciarCiclo(minutos);
+      }
+      break;
+    }
+    case MENU_CONSULTAS:
+      abrirConsulta();
+      break;
+    case COLA_CONSULTA:
+    case VER_MI_TURNO:
+      break;
+    case PIN_MI_TURNO:
+      procesarPinMiTurno();
+      break;
+    case AVISO:
+      break;
+  }
+}
+
+void regresar() {
+  switch (pantalla) {
+    case MENU:
+      return;
+    case EQUIPO:
+      irMenu();
+      return;
+    case MENU_CONSULTAS:
+      irMenu();
+      return;
+    case COLA_CONSULTA:
+    case PIN_MI_TURNO:
+    case VER_MI_TURNO:
+      pantalla = MENU_CONSULTAS;
+      mostrarVista();
+      return;
+    case AVISO:
+      irMenu();
+      return;
+    default:
+      irEquipo();
+      return;
+  }
+}
+
+// FUNC/STOP solo vuelve al menu; NUNCA cancela un ciclo activo.
+void funcionStop() { irMenu(); }
+
+void seleccionarArriba() {
+  switch (pantalla) {
+    case MENU: if (opcionMenu > 0) --opcionMenu; break;
+    case MENU_CONSULTAS: if (opcionConsulta > 0) --opcionConsulta; break;
+    case TANDAS: if (tandasElegidas < MAX_TANDAS) ++tandasElegidas; break;
+    case COLA_CONSULTA: if (desplazamientoCola > 0) --desplazamientoCola; break;
+    case VER_MI_TURNO: maquinaConsulta = 0; break;
+    default: return;
+  }
+  mostrarVista();
+}
+
+void seleccionarAbajo() {
+  switch (pantalla) {
+    case MENU: if (opcionMenu < 2) ++opcionMenu; break;
+    case MENU_CONSULTAS: if (opcionConsulta < 2) ++opcionConsulta; break;
+    case TANDAS: if (tandasElegidas > 1) --tandasElegidas; break;
+    case COLA_CONSULTA:
+      if (desplazamientoCola + 1 < cantidadCola[maquinaConsulta]) ++desplazamientoCola;
+      break;
+    case VER_MI_TURNO: maquinaConsulta = 1; break;
+    default: return;
+  }
+  mostrarVista();
+}
+
+void agregarNumero(int n) {
+  if (pantalla == MENU && n >= 1 && n <= 3) {
+    opcionMenu = n - 1;
+    confirmar();
+    return;
+  }
+  if (pantalla == MENU_CONSULTAS && n >= 1 && n <= 3) {
+    opcionConsulta = n - 1;
+    abrirConsulta();
+    return;
+  }
+  if (pantalla == TANDAS && n >= 1 && n <= MAX_TANDAS) {
+    tandasElegidas = n;
+    mostrarVista();
+    return;
+  }
+  if (pantalla != PIN_EQUIPO && pantalla != PIN_MI_TURNO && pantalla != TIEMPO) return;
+  size_t maximo = pantalla == TIEMPO ? 3 : 4;
+  if (entrada.length() >= maximo) return;
+  entrada += String(n);
+  mostrarVista();
+}
+
+int codigoANumero(uint8_t codigo) {
+  switch (codigo) {
+    case 0x16: return 0;
+    case 0x0C: return 1;
+    case 0x18: return 2;
+    case 0x5E: return 3;
+    case 0x08: return 4;
+    case 0x1C: return 5;
+    case 0x5A: return 6;
+    case 0x42: return 7;
+    case 0x52: return 8;
+    case 0x4A: return 9;
+    default: return -1;
+  }
+}
+
+void revisarControl() {
+  if (!IrReceiver.decode()) return;
+  if (!(IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT)) {
+    uint8_t codigo = IrReceiver.decodedIRData.command;
+    Serial.printf("IR recibido: 0x%02X\n", codigo);
+    if (codigo == IR_ARRIBA) seleccionarArriba();
+    else if (codigo == IR_ABAJO) seleccionarAbajo();
+    else if (codigo == IR_IZQUIERDA) regresar();
+    else if (codigo == IR_DERECHA) {
+      if (pantalla == MENU || pantalla == MENU_CONSULTAS || pantalla == EQUIPO) confirmar();
+    } else if (codigo == IR_FUNC_STOP) funcionStop();
+    else if (codigo == IR_PLAY_OK) confirmar();
+    else {
+      int n = codigoANumero(codigo);
+      if (n >= 0) agregarNumero(n);
+    }
+  }
+  IrReceiver.resume();
+}
+
+void revisarJoystick() {
+  int y = analogRead(JOY_Y);
+  int x = analogRead(JOY_X);
+  bool permiteVertical = pantalla == MENU || pantalla == MENU_CONSULTAS ||
+                         pantalla == TANDAS || pantalla == COLA_CONSULTA ||
+                         pantalla == VER_MI_TURNO;
+  if (permiteVertical && !joyVerticalActivo) {
+    if (y < 1200) { seleccionarArriba(); joyVerticalActivo = true; }
+    else if (y > 2800) { seleccionarAbajo(); joyVerticalActivo = true; }
+  }
+  if (y > 1600 && y < 2500) joyVerticalActivo = false;
+
+  if (!joyHorizontalActivo && (x < 1200 || x > 2800)) {
+    regresar();
+    joyHorizontalActivo = true;
+  }
+  if (x > 1600 && x < 2500) joyHorizontalActivo = false;
+
+  bool boton = digitalRead(JOY_SW);
+  if (boton == LOW && botonAnterior == HIGH && millis() - ultimoBoton > 250) {
+    ultimoBoton = millis();
+    confirmar();
+  }
+  botonAnterior = boton;
+}
+
+// -------------------- DOS TEMPORIZADORES SIMULTANEOS --------------------
+void actualizarCiclos() {
+  unsigned long ahora = millis();
+  for (int m = 0; m < 2; m++) {
+    Equipo &e = equipos[m];
+    if (e.estado != EN_USO) continue;
+    unsigned long segundos = (ahora - e.ultimoTick) / 1000UL;
+    if (segundos == 0) continue;
+    e.ultimoTick += segundos * 1000UL;
+    if (segundos >= e.restantes) {
+      e.restantes = 0;
+      e.estado = TERMINADO;
+      actualizarLeds();
+      iniciarPitidos(3);
+      Serial.println(m == 0 ? "Lavadora terminada" : "Secadora terminada");
+    } else {
+      e.restantes -= segundos;
+    }
+    if (pantalla == EQUIPO && maquina == m) mostrarVista();
+  }
+}
+
+// Prueba opcional de ausencia desde el Monitor Serial (115200):
+// DISP 2345 0 -> Kelvin no disponible; DISP 2345 1 -> disponible.
+// No sustituye el futuro cambio de disponibilidad desde la WEB.
+void procesarComandoDemo(String comando) {
+  comando.trim();
+  if (!comando.startsWith("DISP ")) return;
+  int separador = comando.indexOf(' ', 5);
+  if (separador < 0) return;
+  String pin = comando.substring(5, separador);
+  String valor = comando.substring(separador + 1);
+  valor.trim();
+  if (valor != "0" && valor != "1") return;
+  for (int i = 0; i < NUM_USUARIOS; i++) {
+    if (pin == usuarios[i].pin) {
+      usuarios[i].disponible = (valor == "1");
+      Serial.println(nombreUsuario(i) + (usuarios[i].disponible ? " DISPONIBLE" : " NO DISPONIBLE"));
+      if (pantalla == COLA_CONSULTA || pantalla == VER_MI_TURNO) mostrarVista();
+      return;
+    }
+  }
+}
+
+void revisarSerialDemo() {
+  static String buffer = "";
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (buffer.length()) { procesarComandoDemo(buffer); buffer = ""; }
+    } else if (buffer.length() < 40) {
+      buffer += c;
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(9600, SERIAL_8N1, 16, 17); // Mismo TX17 -> UNO D2.
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  pinMode(JOY_SW, INPUT_PULLUP);
+  analogReadResolution(12);
+  prepararYProbarLeds();
+  IrReceiver.begin(IR_PIN, ENABLE_LED_FEEDBACK);
+
+  delay(1200);
+  Serial.println("=== LavaRESI: menu, tandas y consultas DEMO ===");
+  Serial.println("PIN demo: Melissa 1234 | Kelvin 2345 | Andy 3456 | Andrei 4567");
+  Serial.println("Control remoto, joystick, 6 LED, buzzer y dos ciclos independientes.");
+  lcdEnviar("LavaRESI", "Terminal lista");
+  delay(1400);
+  irMenu();
+}
+
+void loop() {
+  actualizarBuzzer();
+  actualizarCiclos();
+  actualizarAviso();
+  revisarControl();
+  revisarJoystick();
+  revisarSerialDemo();
+  delay(20);
+}
