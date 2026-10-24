@@ -1,10 +1,16 @@
 #include <Arduino.h>
 #include <IRremote.hpp>
+#include <HTTPClient.h>
+#include <WiFi.h>
+// Config wifi, yo le comparti desde mi compu hacia el esp32, solo le pone sus credenciales
+static const char* const WIFI_SSID = "LaptopMelissa";
+static const char* const WIFI_PASSWORD = "19732002";
 
 // LavaRESI - ESP32, etapa 1: menu, tandas y consultas locales.
 // Se conserva el cableado ORIGINAL. El UNO continua recibiendo: linea1|linea2
-// IMPORTANTE: Usuarios y colas son SOLO DE DEMOSTRACION; no hay Wi-Fi,
-// base de datos, notificaciones ni Prolog conectados todavia.
+// IMPORTANTE: Usuarios y colas todavia son SOLO DE DEMOSTRACION.
+// Wi-Fi funciona, pero el backend, base de datos y Prolog NO estan conectados.
+// Wi-Fi configurado en este mismo archivo para facilitar las pruebas.
 
 #define JOY_X 32
 #define JOY_Y 35
@@ -97,6 +103,48 @@ bool joyVerticalActivo = false;
 bool joyHorizontalActivo = false;
 bool botonAnterior = HIGH;
 unsigned long ultimoBoton = 0;
+
+// -------------------- WIFI SIN ESPERAS BLOQUEANTES --------------------
+// El ESP32 utiliza el Wi-Fi local; el UNO sigue dedicado a la LCD.
+// IMPORTANTE: por ahora el Wi-Fi NO autentica usuarios ni autoriza turnos.
+unsigned long ultimaRevisionWiFi = 0;
+unsigned long ultimoReintentoWiFi = 0;
+wl_status_t estadoWiFiAnterior = WL_IDLE_STATUS;
+
+void iniciarWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("WiFi: conectando a ");
+  Serial.println(WIFI_SSID);
+}
+
+void actualizarWiFi() {
+  unsigned long ahora = millis();
+  if (ahora - ultimaRevisionWiFi < 1000UL) return;
+  ultimaRevisionWiFi = ahora;
+
+  wl_status_t estado = WiFi.status();
+  if (estado != estadoWiFiAnterior) {
+    if (estado == WL_CONNECTED) {
+      Serial.print("WiFi conectado! Direccion IP del ESP32: ");
+      Serial.println(WiFi.localIP());
+    } else if (estadoWiFiAnterior == WL_CONNECTED) {
+      Serial.println("WiFi desconectado; temporizadores locales siguen activos.");
+    } else {
+      Serial.print("WiFi: estado ");
+      Serial.println((int)estado);
+    }
+    estadoWiFiAnterior = estado;
+  }
+
+  // Reintento sin 'while' ni delays; los controles y ciclos siguen atendidos.
+  if (estado != WL_CONNECTED && ahora - ultimoReintentoWiFi >= 20000UL) {
+    ultimoReintentoWiFi = ahora;
+    Serial.println("WiFi: reintentando conexion...");
+    WiFi.reconnect();
+  }
+}
 
 // -------------------- BUZZER NO BLOQUEANTE --------------------
 uint8_t pitidosPendientes = 0;
@@ -784,6 +832,45 @@ void revisarSerialDemo() {
   }
 }
 
+const char* URL_BACKEND = "http://192.168.137.1:8000/api/health";
+bool pruebaBackendRealizada = false;
+
+void probarConexionBackend() {
+  if (pruebaBackendRealizada || WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  pruebaBackendRealizada = true;
+
+  WiFiClient cliente;
+  HTTPClient http;
+
+  http.setConnectTimeout(1500);
+  http.setTimeout(1500);
+
+  if (!http.begin(cliente, URL_BACKEND)) {
+    Serial.println("No se pudo iniciar la solicitud HTTP");
+    return;
+  }
+
+  Serial.println("Consultando backend LavaRESI...");
+
+  int codigo = http.GET();
+
+  if (codigo == 200) {
+    Serial.println("Backend conectado correctamente!");
+    Serial.println(http.getString());
+  } else if (codigo > 0) {
+    Serial.printf("Respuesta HTTP: %d\n", codigo);
+  } else {
+    Serial.print("Error de conexion: ");
+    Serial.println(http.errorToString(codigo));
+  }
+
+  http.end();
+}
+
+
 void setup() {
   Serial.begin(115200);
   Serial2.begin(9600, SERIAL_8N1, 16, 17); // Mismo TX17 -> UNO D2.
@@ -801,14 +888,17 @@ void setup() {
   lcdEnviar("LavaRESI", "Terminal lista");
   delay(1400);
   irMenu();
+  iniciarWiFi(); // No esperamos a conectar: el sistema queda operativo.
 }
 
 void loop() {
+  actualizarWiFi();
   actualizarBuzzer();
   actualizarCiclos();
   actualizarAviso();
   revisarControl();
   revisarJoystick();
   revisarSerialDemo();
+  probarConexionBackend();
   delay(20);
 }
