@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LavaRESI · Lavandería de la residencia</title>
+  <link rel="stylesheet" href="css/estilos.css">
+</head>
+
+<body>
+  <header class="barra">
+    <h1>🫧 LavaRESI</h1>
+    <nav>
+      <button class="nav activo" data-vista="estado">Estado</button>
+      <button class="nav" data-vista="cuenta">Mi cuenta <span id="insignia" class="insignia" hidden></span></button>
+    </nav>
+  </header>
+
+  <main>
+    <section id="vista-estado">
+      <h2>Estado de las máquinas</h2>
+      <div id="maquinas" class="rejilla">
+        <p class="suave">Cargando…</p>
+      </div>
+      <p id="actualizado" class="suave pequeno"></p>
+    </section>
+
+    <section id="vista-cuenta" hidden>
+      <div id="auth" class="tarjeta">
+        <div class="pestanas">
+          <button class="pestana activo" data-form="login">Ingresar</button>
+          <button class="pestana" data-form="registro">Crear cuenta</button>
+        </div>
+        <form id="form-login" class="formulario">
+          <label>Usuario <input name="usuario" autocomplete="username" required></label>
+          <label>Contraseña <input name="password" type="password" autocomplete="current-password" required></label>
+          <button class="primario">Ingresar</button>
+        </form>
+        <form id="form-registro" class="formulario" hidden>
+          <label>Nombre completo <input name="nombre" minlength="2" maxlength="60" required></label>
+          <label>Usuario <input name="usuario" minlength="3" maxlength="30" pattern="[A-Za-z0-9_.\-]+" required></label>
+          <label>PIN de 4 dígitos <small>(lo usarás en la terminal física)</small>
+            <input name="pin" inputmode="numeric" pattern="\d{4}" maxlength="4" required></label>
+          <label>Contraseña <small>(mínimo 6 caracteres, para esta página)</small>
+            <input name="password" type="password" minlength="6" autocomplete="new-password" required></label>
+          <button class="primario">Crear cuenta</button>
+        </form>
+        <p id="msg-auth" class="mensaje" role="alert"></p>
+      </div>
+
+      <div id="panel" hidden>
+        <div class="tarjeta">
+          <div class="fila-entre">
+            <h2 id="saludo"></h2>
+            <button id="salir" class="secundario">Cerrar sesión</button>
+          </div>
+
+          <h3>Mis turnos</h3>
+          <div id="mis-turnos"></div>
+
+          <h3>Pedir un turno</h3>
+          <form id="form-turno" class="fila-form">
+            <label>Máquina
+              <select name="maquina_id">
+                <option value="1">Lavadora</option>
+                <option value="2">Secadora</option>
+              </select>
+            </label>
+            <label>Tandas
+              <select name="tandas">
+                <option>1</option>
+                <option>2</option>
+                <option>3</option>
+              </select>
+            </label>
+            <button class="primario">Pedir turno</button>
+          </form>
+          <p id="msg-turno" class="mensaje" role="alert"></p>
+        </div>
+
+        <div class="tarjeta">
+          <div class="fila-entre">
+            <h3>Avisos</h3>
+            <button id="leer" class="secundario">Marcar como leídos</button>
+          </div>
+          <ul id="avisos" class="avisos"></ul>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="js/app.js"></script>
+</body>
+
+</html>
