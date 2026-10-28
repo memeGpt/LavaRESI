@@ -1,36 +1,34 @@
-"""Acceso a SQLite. Cada petición usa una transacción BEGIN IMMEDIATE para
-evitar que dos peticiones simultáneas (ESP32 + web) se pisen entre sí."""
-import sqlite3
+"""Acceso a PostgreSQL para LavaRESI."""
 from contextlib import contextmanager
 
-from .config import DB_PATH, SCHEMA_PATH
+import psycopg
+from psycopg.rows import dict_row
+
+from .config import DATABASE_URL, SCHEMA_PATH
 
 
-def conectar() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+def conectar():
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "Falta la variable de entorno DATABASE_URL. Configúrala con la cadena de conexión de Neon."
+        )
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
 @contextmanager
 def transaccion():
-    conn = conectar()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
+    """Abre una transacción; confirma si termina bien y revierte si hay error."""
+    with conectar() as conn:
+        # Serializa las operaciones de negocio para mantener consistente la cola.
+        conn.execute("SELECT pg_advisory_xact_lock(76843021)")
         yield conn
-        conn.execute("COMMIT")
-    except BaseException:
-        conn.execute("ROLLBACK")
-        raise
-    finally:
-        conn.close()
 
 
 def inicializar():
-    """Crea las tablas si no existen (usa el schema.sql del proyecto)."""
-    conn = conectar()
-    try:
-        conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
-    finally:
-        conn.close()
+    """Crea las tablas e índices si no existen y carga las máquinas iniciales."""
+    contenido = SCHEMA_PATH.read_text(encoding="utf-8")
+    with conectar() as conn:
+        for sentencia in contenido.split(";"):
+            sentencia = sentencia.strip()
+            if sentencia:
+                conn.execute(sentencia)

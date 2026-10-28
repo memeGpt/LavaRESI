@@ -93,5 +93,5 @@ def disponibilidad(sid: int, datos: DisponibilidadIn, lavaresi_sesion: str | Non
 def marcar_leidas(lavaresi_sesion: str | None = Cookie(default=None)):
     uid = _sesion(lavaresi_sesion)
     with transaccion() as conn:
-        conn.execute("UPDATE notificaciones SET leida = 1 WHERE usuario_id = ?", (uid,))
+        conn.execute("UPDATE notificaciones SET leida = 1 WHERE usuario_id = %s", (uid,))
         return {"ok": True}

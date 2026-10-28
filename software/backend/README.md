@@ -70,3 +70,11 @@ backend/
 
 - `app/prueba_conexion.py` quedó del primer prototipo; ya no se usa (`/api/health` está en `rutas/publico.py`).
 - Los PIN y contraseñas se guardan con hash PBKDF2, nunca en texto plano. El PIN debe ser único entre usuarios.
+
+
+## PostgreSQL (Neon)
+
+Configura la variable de entorno `DATABASE_URL` con la cadena de conexión de Neon.
+La aplicación crea las tablas al iniciar. No guardes la cadena de conexión en Git.
+En Render configura `DATABASE_URL` en Environment Variables y conserva tus variables
+`LAVARESI_SECRET` y `LAVARESI_TERMINAL_KEY`.

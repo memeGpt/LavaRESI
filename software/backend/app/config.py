@@ -4,7 +4,7 @@ import secrets
 from pathlib import Path
 
 RAIZ = Path(__file__).resolve().parents[1]          # software/backend
-DB_PATH = Path(os.getenv("LAVARESI_DB", RAIZ / "lavaresi.db"))
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 SCHEMA_PATH = RAIZ / "database" / "schema.sql"
 PROLOG_PATH = RAIZ / "prolog" / "reglas_turnos.pl"
 FRONTEND_PATH = RAIZ.parent / "frontend"
