@@ -1,4 +1,3 @@
-
 """
 LavaRESI - Rutas de estudiantes.
 
@@ -19,7 +18,7 @@ from fastapi import (
     Response,
 )
 
-from ..db import transaccion
+from ..db import lectura, transaccion
 from ..modelos.esquemas import (
     DisponibilidadIn,
     LoginIn,
@@ -173,14 +172,12 @@ def yo(
     lavaresi_sesion: str | None = Cookie(default=None),
 ):
 
-    with transaccion() as conn:
+    with lectura() as conn:
 
         usuario_id = exigir_sesion(
             conn,
             lavaresi_sesion,
         )
-
-        turnos.actualizar_ciclos(conn)
 
         usuario = turnos.datos_usuario(
             conn,

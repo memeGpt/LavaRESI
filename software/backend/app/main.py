@@ -1,16 +1,16 @@
-
 """LavaRESI - Servidor FastAPI con actualización en tiempo real."""
 
 import asyncio
 import logging
 from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import FRONTEND_PATH
-from .db import inicializar, transaccion
+from .db import cerrar_pool, inicializar, lectura, obtener_pool, transaccion
 from .rutas import publico, terminal, web, eventos
 from .servicios import turnos
 from .servicios.turnos import ErrorNegocio
@@ -21,77 +21,52 @@ log = logging.getLogger("lavaresi")
 # --------------------------------------------
 # REVISIÓN AUTOMÁTICA DE CICLOS
 # --------------------------------------------
+# CAMBIO: antes se abría una transacción con el candado global cada
+# 1.5 s y todas las demás peticiones tenían que esperar. Ahora se hace
+# UNA consulta de lectura (sin candado) y solo se escribe cuando de
+# verdad venció un ciclo. Los cambios hechos desde la web o el ESP32
+# ya avisan por WebSocket en sus propias rutas.
 
-def comprobar_cambios():
-    """Consulta ciclos vencidos y detecta cambios de estado."""
+def comprobar_cambios() -> bool:
+    """Devuelve True si algún ciclo venció y se actualizó la base."""
+
+    with lectura() as conn:
+        activos = conn.execute("""
+            SELECT fecha_inicio, duracion_minutos
+            FROM ciclos
+            WHERE estado = 'EN_CURSO'
+        """).fetchall()
+
+    ahora = datetime.now(timezone.utc)
+
+    hay_vencido = any(
+        turnos._fecha(c["fecha_inicio"])
+        + timedelta(minutes=c["duracion_minutos"]) <= ahora
+        for c in activos
+    )
+
+    if not hay_vencido:
+        return False
 
     with transaccion() as conn:
-
-        # Marca como terminados los ciclos cuyo tiempo finalizó.
         turnos.actualizar_ciclos(conn)
 
-        maquinas = conn.execute("""
-            SELECT id, estado
-            FROM maquinas
-            ORDER BY id
-        """).fetchall()
-
-        solicitudes = conn.execute("""
-            SELECT id, estado, disponible, tandas_iniciadas
-            FROM solicitudes
-            WHERE estado IN (
-                'EN_ESPERA',
-                'AUTORIZADA',
-                'EN_USO'
-            )
-            ORDER BY id
-        """).fetchall()
-
-        estado_actual = (
-            tuple(
-                (m["id"], m["estado"])
-                for m in maquinas
-            ),
-            tuple(
-                (
-                    s["id"],
-                    s["estado"],
-                    s["disponible"],
-                    s["tandas_iniciadas"]
-                )
-                for s in solicitudes
-            )
-        )
-
-        return estado_actual
+    return True
 
 
 async def vigilar_ciclos():
-    """Revisa cambios sin bloquear la atención de FastAPI."""
-
-    estado_anterior = None
+    """Revisa ciclos vencidos sin bloquear la atención de FastAPI."""
 
     while True:
         try:
-            estado_actual = await asyncio.to_thread(
-                comprobar_cambios
-            )
-
-            if (
-                estado_anterior is not None
-                and estado_actual != estado_anterior
-            ):
+            if await asyncio.to_thread(comprobar_cambios):
                 await eventos.avisar_cambio()
-
-            estado_anterior = estado_actual
 
         except asyncio.CancelledError:
             raise
 
         except Exception:
-            log.exception(
-                "Error al revisar los ciclos de LavaRESI"
-            )
+            log.exception("Error al revisar los ciclos de LavaRESI")
 
         await asyncio.sleep(1.5)
 
@@ -105,6 +80,9 @@ async def ciclo_de_vida(app: FastAPI):
 
     inicializar()
 
+    # Abre las conexiones a Neon desde el arranque (no en la 1.ª petición).
+    await asyncio.to_thread(obtener_pool)
+
     tarea = asyncio.create_task(vigilar_ciclos())
 
     try:
@@ -115,6 +93,8 @@ async def ciclo_de_vida(app: FastAPI):
 
         with suppress(asyncio.CancelledError):
             await tarea
+
+        cerrar_pool()
 
 
 # --------------------------------------------

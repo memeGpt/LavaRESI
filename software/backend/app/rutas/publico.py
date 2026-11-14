@@ -1,4 +1,3 @@
-
 """
 LavaRESI - Rutas públicas.
 
@@ -24,7 +23,7 @@ from fastapi import (
 )
 
 from ..config import TERMINAL_KEY
-from ..db import transaccion
+from ..db import lectura
 from ..seguridad import leer_token
 from ..servicios import turnos
 
@@ -80,10 +79,9 @@ def estado(
     # Verificar la cookie de sesión de la web.
     usuario_id = leer_token(lavaresi_sesion)
 
-    with transaccion() as conn:
+    with lectura() as conn:
 
-        # Comprobar si terminó algún ciclo.
-        turnos.actualizar_ciclos(conn)
+        # (Los ciclos vencidos los actualiza main.vigilar_ciclos.)
 
         sesion_valida = False
 

@@ -1,4 +1,3 @@
-
 """
 LavaRESI - API de la terminal ESP32.
 
@@ -26,7 +25,7 @@ from fastapi import (
 )
 
 from ..config import TERMINAL_KEY
-from ..db import transaccion
+from ..db import lectura, transaccion
 
 from ..modelos.esquemas import (
     IniciarIn,
@@ -121,9 +120,7 @@ def mi_turno(
     Devuelve sus solicitudes actuales.
     """
 
-    with transaccion() as conn:
-
-        turnos.actualizar_ciclos(conn)
+    with lectura() as conn:
 
         usuario = _usuario(
             conn,

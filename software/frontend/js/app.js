@@ -1,4 +1,3 @@
-
 // ==========================================
 // LavaRESI - Frontend
 // Inicio de sesión, turnos y tiempo real
@@ -19,6 +18,7 @@ const ESTADOS = {
 };
 
 let cuenta = null;
+const avisosOcultos = new Set();   // avisos que la persona ya quitó (se ocultan al instante)
 let maquinas = [];
 let sesionConsultada = false;
 let refrescando = false;
@@ -30,6 +30,8 @@ let firmaAvisos = "";
 
 let socket = null;
 let intentosSocket = 0;
+let socketAbierto = false;   // NUEVO: dice si el WebSocket está conectado
+let ultimoRefresco = 0;      // NUEVO: para el respaldo de consulta
 
 // ==========================================
 // FUNCIONES GENERALES
@@ -52,7 +54,26 @@ function mensaje(id, texto, exito = false) {
     (texto ? (exito ? " exito" : " error") : "");
 }
 
+// Contador de peticiones en curso: muestra la barra de carga
+let pendientes = 0;
+
+function cargando(delta) {
+  pendientes = Math.max(0, pendientes + delta);
+  document.body.classList.toggle("cargando", pendientes > 0);
+}
+
 async function api(ruta, metodo = "GET", datos = null) {
+  cargando(1);
+
+  try {
+    return await peticion(ruta, metodo, datos);
+
+  } finally {
+    cargando(-1);
+  }
+}
+
+async function peticion(ruta, metodo = "GET", datos = null) {
   const respuesta = await fetch("/api" + ruta, {
     method: metodo,
     credentials: "same-origin",
@@ -113,10 +134,7 @@ function formatoTiempo(segundos) {
   );
 }
 
-// Cuenta localmente cada segundo.
-// No necesita pedir información al backend
-// cada vez que cambia un número.
-
+// Cuenta localmente cada segundo, sin pedir datos al backend.
 function avanzarContadores() {
   document.querySelectorAll("[data-fin]").forEach(nodo => {
     const restantes =
@@ -144,23 +162,14 @@ function tarjetaMaquina(m) {
   const cabecera = elemento("div", "cabecera-maquina");
 
   cabecera.append(
-    elemento(
-      "h3",
-      "",
-      NOMBRES[m.tipo] || m.tipo
-    ),
-    elemento(
-      "span",
-      "estado-badge " + clase,
-      etiqueta
-    )
+    elemento("h3", "", NOMBRES[m.tipo] || m.tipo),
+    elemento("span", "estado-badge " + clase, etiqueta)
   );
 
   tarjeta.append(cabecera);
 
   // Visitantes: resumen sin nombres.
   // Usuarios con sesión: cola detallada.
-
   const privado =
     cuenta !== null && Array.isArray(m.cola);
 
@@ -218,27 +227,18 @@ function tarjetaMaquina(m) {
 
   } else {
     tarjeta.append(
-      elemento(
-        "p",
-        "suave",
-        "Disponible para el siguiente turno."
-      )
+      elemento("p", "suave", "Disponible para el siguiente turno.")
     );
   }
 
-  // ========================================
-  // LISTAS DE ESPERA
-  // ========================================
-
+  // ---------- Listas de espera ----------
   const lista = elemento("div", "lista-cola");
 
   if (!privado) {
     const total = m.personas_en_espera ??
       (
         Array.isArray(m.cola)
-          ? m.cola.filter(
-            s => s.estado !== "EN_USO"
-          ).length
+          ? m.cola.filter(s => s.estado !== "EN_USO").length
           : null
       );
 
@@ -256,17 +256,11 @@ function tarjetaMaquina(m) {
     );
 
   } else {
-    const espera = m.cola.filter(
-      s => s.estado !== "EN_USO"
-    );
+    const espera = m.cola.filter(s => s.estado !== "EN_USO");
 
     if (!espera.length) {
       lista.append(
-        elemento(
-          "div",
-          "sin-espera",
-          "Sin personas en espera"
-        )
+        elemento("div", "sin-espera", "Sin personas en espera")
       );
     }
 
@@ -278,10 +272,7 @@ function tarjetaMaquina(m) {
           "span",
           "",
           `${s.posicion}. ${s.nombre} · ${s.tandas_totales
-          } ${s.tandas_totales === 1
-            ? "tanda"
-            : "tandas"
-          }`
+          } ${s.tandas_totales === 1 ? "tanda" : "tandas"}`
         )
       );
 
@@ -291,9 +282,7 @@ function tarjetaMaquina(m) {
           ? "Siguiente"
           : "En espera";
 
-      fila.append(
-        elemento("span", "pequeno", texto)
-      );
+      fila.append(elemento("span", "pequeno", texto));
 
       lista.append(fila);
     });
@@ -309,9 +298,8 @@ function tarjetaMaquina(m) {
 // ==========================================
 
 function pintarMaquinas() {
-  // Excluimos el contador de la comparación.
-  // Así no reconstruimos tarjetas cada segundo.
-
+  // Excluimos el contador de la comparación para
+  // no reconstruir las tarjetas cada segundo.
   const firma = JSON.stringify({
     privado: cuenta !== null,
     maquinas: maquinas.map(
@@ -328,15 +316,11 @@ function pintarMaquinas() {
 
   } else {
     // Recalibrar el reloj cuando exista desfase.
-
     $("maquinas")
       .querySelectorAll(".maquina")
       .forEach((tarjeta, i) => {
-        const reloj =
-          tarjeta.querySelector("[data-fin]");
-
-        const segundos =
-          maquinas[i]?.segundos_restantes;
+        const reloj = tarjeta.querySelector("[data-fin]");
+        const segundos = maquinas[i]?.segundos_restantes;
 
         if (
           !reloj ||
@@ -350,9 +334,7 @@ function pintarMaquinas() {
           Date.now() + Number(segundos) * 1000;
 
         if (
-          Math.abs(
-            Number(reloj.dataset.fin) - finServidor
-          ) > 2000
+          Math.abs(Number(reloj.dataset.fin) - finServidor) > 2000
         ) {
           reloj.dataset.fin = String(finServidor);
         }
@@ -360,8 +342,7 @@ function pintarMaquinas() {
   }
 
   $("actualizado").textContent =
-    "Actualizado: " +
-    new Date().toLocaleTimeString("es-CR");
+    "Actualizado: " + new Date().toLocaleTimeString("es-CR");
 }
 
 // ==========================================
@@ -369,16 +350,15 @@ function pintarMaquinas() {
 // ==========================================
 
 function botonAccion(texto, accion) {
-  const boton = elemento(
-    "button",
-    "secundario",
-    texto
-  );
+  const boton = elemento("button", "secundario", texto);
 
   boton.type = "button";
 
   boton.addEventListener("click", async () => {
     boton.disabled = true;
+    boton.textContent = "Cargando…";
+    boton.classList.add("esperando");
+    cargando(1);
     mensaje("msg-turno", "");
 
     try {
@@ -390,6 +370,9 @@ function botonAccion(texto, accion) {
 
     } finally {
       boton.disabled = false;
+      boton.textContent = texto;
+      boton.classList.remove("esperando");
+      cargando(-1);
     }
   });
 
@@ -405,9 +388,7 @@ function pintarTurnos() {
 
   const firma = JSON.stringify({
     turnos: cuenta.solicitudes,
-    estados: maquinas.map(
-      m => [m.id, m.estado]
-    )
+    estados: maquinas.map(m => [m.id, m.estado])
   });
 
   if (firma === firmaTurnos) return;
@@ -417,9 +398,7 @@ function pintarTurnos() {
   const contenedor = $("mis-turnos");
 
   const tarjetas = (cuenta.solicitudes || []).map(s => {
-    const maq = maquinas.find(
-      m => m.id === s.maquina_id
-    );
+    const maq = maquinas.find(m => m.id === s.maquina_id);
 
     const tarjeta = elemento("div", "turno");
 
@@ -441,9 +420,7 @@ function pintarTurnos() {
 
     } else {
       texto =
-        `Puesto ${s.posicion} · ${s.tandas_totales} ${s.tandas_totales === 1
-          ? "tanda"
-          : "tandas"
+        `Puesto ${s.posicion} · ${s.tandas_totales} ${s.tandas_totales === 1 ? "tanda" : "tandas"
         }`;
     }
 
@@ -452,9 +429,7 @@ function pintarTurnos() {
       elemento("p", "suave", texto)
     );
 
-    // Cambiar disponibilidad sin perder
-    // el orden original de la solicitud.
-
+    // Cambiar disponibilidad sin perder el orden.
     if (
       s.estado === "EN_ESPERA" ||
       s.estado === "AUTORIZADA"
@@ -474,10 +449,8 @@ function pintarTurnos() {
       );
     }
 
-    // No cancelar un ciclo activo.
-    // Entre tandas, el backend decide si
-    // permite terminar el turno.
-
+    // No cancelar un ciclo activo. Entre tandas,
+    // el backend decide si permite terminar el turno.
     if (
       s.estado !== "EN_USO" ||
       maq?.estado === "ENTRE_TANDAS"
@@ -488,10 +461,7 @@ function pintarTurnos() {
             ? "Terminar mi turno"
             : "Cancelar solicitud",
 
-          () => api(
-            `/solicitudes/${s.id}/cancelar`,
-            "POST"
-          )
+          () => api(`/solicitudes/${s.id}/cancelar`, "POST")
         )
       );
     }
@@ -504,11 +474,7 @@ function pintarTurnos() {
       tarjetas.length
         ? tarjetas
         : [
-          elemento(
-            "p",
-            "suave",
-            "No tenés solicitudes activas."
-          )
+          elemento("p", "suave", "No tenés solicitudes activas.")
         ]
     )
   );
@@ -521,7 +487,9 @@ function pintarTurnos() {
 function pintarAvisos() {
   if (!cuenta) return;
 
-  const lista = cuenta.notificaciones || [];
+  const lista = (cuenta.notificaciones || []).filter(
+    n => !n.leida && !avisosOcultos.has(n.id)
+  );
   const firma = JSON.stringify(lista);
 
   if (firma === firmaAvisos) return;
@@ -558,11 +526,7 @@ function pintarAvisos() {
       return item;
     })
     : [
-      elemento(
-        "li",
-        "suave",
-        "Sin avisos por ahora."
-      )
+      elemento("li", "suave", "Sin avisos por ahora.")
     ];
 
   $("avisos").replaceChildren(...avisos);
@@ -597,13 +561,17 @@ function pintarCuenta() {
 
   $("abrir-acceso").hidden = entro;
 
-  $("insignia").hidden =
-    !entro || !cuenta.no_leidas;
+  const sinLeer = entro
+    ? (cuenta.notificaciones || []).filter(
+        n => !n.leida && !avisosOcultos.has(n.id)
+      ).length
+    : 0;
+
+  $("insignia").hidden = !sinLeer;
 
   if (!entro) return;
 
-  $("insignia").textContent =
-    cuenta.no_leidas;
+  $("insignia").textContent = sinLeer;
 
   $("saludo").textContent =
     "Hola, " + cuenta.usuario.nombre;
@@ -623,6 +591,7 @@ async function refrescar(forzarSesion = false) {
   }
 
   refrescando = true;
+  ultimoRefresco = Date.now();
 
   try {
     const consultarSesion =
@@ -658,8 +627,7 @@ async function refrescar(forzarSesion = false) {
     }
 
     if (respuestaEstado.status === "fulfilled") {
-      maquinas =
-        respuestaEstado.value.maquinas || [];
+      maquinas = respuestaEstado.value.maquinas || [];
 
       pintarMaquinas();
 
@@ -685,21 +653,12 @@ async function refrescar(forzarSesion = false) {
 // ==========================================
 
 document.querySelectorAll(".nav").forEach(b => {
-  b.addEventListener(
-    "click",
-    () => vista(b.dataset.vista)
-  );
+  b.addEventListener("click", () => vista(b.dataset.vista));
 });
 
-$("vista-previa").addEventListener(
-  "click",
-  () => vista("estado")
-);
+$("vista-previa").addEventListener("click", () => vista("estado"));
 
-$("abrir-acceso").addEventListener(
-  "click",
-  () => vista("cuenta")
-);
+$("abrir-acceso").addEventListener("click", () => vista("cuenta"));
 
 // ==========================================
 // PESTAÑAS INGRESAR / CREAR CUENTA
@@ -711,11 +670,8 @@ document.querySelectorAll(".pestana").forEach(b => {
       x.classList.toggle("activo", x === b);
     });
 
-    $("form-login").hidden =
-      b.dataset.form !== "login";
-
-    $("form-registro").hidden =
-      b.dataset.form !== "registro";
+    $("form-login").hidden = b.dataset.form !== "login";
+    $("form-registro").hidden = b.dataset.form !== "registro";
 
     mensaje("msg-auth", "");
   });
@@ -731,23 +687,22 @@ function conectarFormulario(id, ruta, mensajeId) {
   form.addEventListener("submit", async e => {
     e.preventDefault();
 
-    const boton =
-      form.querySelector('button[type="submit"]');
+    const boton = form.querySelector('button[type="submit"]');
 
     if (boton.disabled) return;
 
+    const textoBoton = boton.textContent;
     boton.disabled = true;
+    boton.textContent = "Cargando…";
+    boton.classList.add("esperando");
+    cargando(1);
     mensaje(mensajeId, "");
 
-    const datos =
-      Object.fromEntries(new FormData(form));
+    const datos = Object.fromEntries(new FormData(form));
 
     if (ruta === "/solicitudes") {
-      datos.maquina_id =
-        Number(datos.maquina_id);
-
-      datos.tandas =
-        Number(datos.tandas);
+      datos.maquina_id = Number(datos.maquina_id);
+      datos.tandas = Number(datos.tandas);
     }
 
     try {
@@ -772,11 +727,7 @@ function conectarFormulario(id, ruta, mensajeId) {
         vista("estado");
 
       } else {
-        mensaje(
-          mensajeId,
-          "Turno registrado correctamente.",
-          true
-        );
+        mensaje(mensajeId, "Turno registrado correctamente.", true);
       }
 
     } catch (err) {
@@ -784,27 +735,16 @@ function conectarFormulario(id, ruta, mensajeId) {
 
     } finally {
       boton.disabled = false;
+      boton.textContent = textoBoton;
+      boton.classList.remove("esperando");
+      cargando(-1);
     }
   });
 }
 
-conectarFormulario(
-  "form-login",
-  "/auth/login",
-  "msg-auth"
-);
-
-conectarFormulario(
-  "form-registro",
-  "/auth/registro",
-  "msg-auth"
-);
-
-conectarFormulario(
-  "form-turno",
-  "/solicitudes",
-  "msg-turno"
-);
+conectarFormulario("form-login", "/auth/login", "msg-auth");
+conectarFormulario("form-registro", "/auth/registro", "msg-auth");
+conectarFormulario("form-turno", "/solicitudes", "msg-turno");
 
 // ==========================================
 // CERRAR SESIÓN
@@ -815,6 +755,7 @@ $("salir").addEventListener("click", async () => {
     await api("/auth/logout", "POST");
 
     cuenta = null;
+    avisosOcultos.clear();
     sesionConsultada = true;
 
     firmaMaquinas = "";
@@ -824,11 +765,7 @@ $("salir").addEventListener("click", async () => {
     maquinas = [];
 
     $("maquinas").replaceChildren(
-      elemento(
-        "p",
-        "suave",
-        "Cargando disponibilidad…"
-      )
+      elemento("p", "suave", "Cargando disponibilidad…")
     );
 
     pintarCuenta();
@@ -846,16 +783,24 @@ $("salir").addEventListener("click", async () => {
 // ==========================================
 
 $("leer").addEventListener("click", async () => {
+  // Quitar de la pantalla YA, sin esperar al servidor.
+  if (cuenta) {
+    (cuenta.notificaciones || []).forEach(n => avisosOcultos.add(n.id));
+    firmaAvisos = "";
+    pintarCuenta();
+  }
+
   try {
-    await api(
-      "/notificaciones/leidas",
-      "POST"
-    );
+    await api("/notificaciones/leidas", "POST");
 
     await refrescar();
 
   } catch (err) {
+    // Si falló, volver a mostrarlos.
+    avisosOcultos.clear();
+    firmaAvisos = "";
     mensaje("msg-turno", err.message);
+    await refrescar();
   }
 });
 
@@ -863,17 +808,13 @@ $("leer").addEventListener("click", async () => {
 // WEBSOCKET - ACTUALIZACIONES INMEDIATAS
 // ==========================================
 
-// WebSocket avisa cuando cambian los datos.
-// Después, la página consulta FastAPI usando
-// la sesión del usuario.
-//
-// No se envían PIN ni contraseñas por WebSocket.
+// El WebSocket solo avisa cuando algo cambia.
+// Después, la página consulta FastAPI con la sesión
+// del usuario. No se envían PIN ni contraseñas.
 
 function conectarWebSocket() {
   const protocolo =
-    location.protocol === "https:"
-      ? "wss:"
-      : "ws:";
+    location.protocol === "https:" ? "wss:" : "ws:";
 
   socket = new WebSocket(
     `${protocolo}//${location.host}/ws/estado`
@@ -881,6 +822,7 @@ function conectarWebSocket() {
 
   socket.onopen = () => {
     intentosSocket = 0;
+    socketAbierto = true;      // NUEVO
     void refrescar();
   };
 
@@ -902,18 +844,12 @@ function conectarWebSocket() {
   };
 
   socket.onclose = () => {
-    intentosSocket =
-      Math.min(intentosSocket + 1, 5);
+    socketAbierto = false;     // NUEVO
+    intentosSocket = Math.min(intentosSocket + 1, 5);
 
-    const espera = Math.min(
-      30000,
-      1000 * 2 ** intentosSocket
-    );
+    const espera = Math.min(30000, 1000 * 2 ** intentosSocket);
 
-    setTimeout(
-      conectarWebSocket,
-      espera
-    );
+    setTimeout(conectarWebSocket, espera);
   };
 }
 
@@ -929,22 +865,21 @@ void refrescar(true).then(() => {
 // Escuchar cambios del backend.
 conectarWebSocket();
 
-// Respaldo por si se pierde un evento
-// o se desconecta WebSocket.
-
+// Respaldo por si se pierde un evento o el WebSocket no conecta:
+// con WebSocket activo consulta cada 15 s; sin él, cada 3 s.
 setInterval(() => {
+  if (document.hidden) return;
+
+  const cada = socketAbierto ? 15000 : 3000;
+
+  if (Date.now() - ultimoRefresco >= cada) {
+    void refrescar();
+  }
+}, 1000);
+
+// Al regresar a la pestaña, actualizar.
+document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
     void refrescar();
   }
-}, 15000);
-
-// Al regresar a la pestaña, actualizar.
-
-document.addEventListener(
-  "visibilitychange",
-  () => {
-    if (!document.hidden) {
-      void refrescar();
-    }
-  }
-);
+});
