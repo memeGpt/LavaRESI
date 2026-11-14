@@ -2,14 +2,21 @@
 #include <IRremote.hpp>
 #include <HTTPClient.h>
 #include <WiFi.h>
+#include <ArduinoJson.h>  // Biblioteca ArduinoJson 7.x
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
 // Config wifi, yo le comparti desde mi compu hacia el esp32, solo le pone sus credenciales
 static const char* const WIFI_SSID = "LaptopMelissa";
 static const char* const WIFI_PASSWORD = "19732002";
 
-// LavaRESI - ESP32, etapa 1: menu, tandas y consultas locales.
+// LavaRESI - integracion real ESP32 <-> FastAPI. Backend = fuente unica de turnos.
+// Ajustes: colas privadas, Mi turno en ambas maquinas, buzzer por tarea y LCD sin bloqueo.
+// Se conserva el funcionamiento fisico probado de ambos RGB y los controles.
 // Se conserva el cableado ORIGINAL. El UNO continua recibiendo: linea1|linea2
-// IMPORTANTE: Usuarios y colas todavia son SOLO DE DEMOSTRACION.
-// Wi-Fi funciona, pero el backend, base de datos y Prolog NO estan conectados.
+// Modo API: los PIN, solicitudes y estados se consultan al backend PostgreSQL.
+// Los datos locales de demo se conservan SOLO como codigo historico, NO se usan en modo API.
 // Wi-Fi configurado en este mismo archivo para facilitar las pruebas.
 
 #define JOY_X 32
@@ -146,69 +153,116 @@ void actualizarWiFi() {
   }
 }
 
-// -------------------- BUZZER NO BLOQUEANTE --------------------
-uint8_t pitidosPendientes = 0;
-bool buzzerEncendido = false;
-unsigned long cambioBuzzer = 0;
-const unsigned long DURACION_PITIDO_MS = 150;
-const unsigned long PAUSA_PITIDO_MS = 140;
+// -------------------- BUZZER INDEPENDIENTE DE LA RED --------------------
+// Buzzer activo con transistor PN2222A, GPIO26. Mantiene sonido corto
+// aunque una solicitud HTTP al servidor tarde varios segundos.
+const uint16_t DURACION_PITIDO_MS = 150;  // Igual a la version original probada.
+const uint16_t PAUSA_PITIDO_MS = 140;
+QueueHandle_t colaPitidos = nullptr;
 
-void iniciarPitidos(uint8_t cantidad) {
-  if (cantidad == 0) return;
-  if (buzzerEncendido || pitidosPendientes > 0) {
-    if (cantidad > pitidosPendientes) pitidosPendientes = cantidad;
-    return;
-  }
-  pitidosPendientes = cantidad;
-  buzzerEncendido = true;
-  digitalWrite(BUZZER_PIN, HIGH);
-  cambioBuzzer = millis();
-}
-
-void actualizarBuzzer() {
-  if (pitidosPendientes == 0) return;
-  unsigned long ahora = millis();
-  if (buzzerEncendido) {
-    if (ahora - cambioBuzzer >= DURACION_PITIDO_MS) {
+void tareaBuzzer(void *parametro) {
+  uint8_t cantidad = 0;
+  for (;;) {
+    if (xQueueReceive(colaPitidos, &cantidad, portMAX_DELAY) == pdTRUE) {
+      cantidad = constrain(cantidad, 1, 3);
+      for (uint8_t i = 0; i < cantidad; i++) {
+        digitalWrite(BUZZER_PIN, HIGH);
+        vTaskDelay(pdMS_TO_TICKS(DURACION_PITIDO_MS));
+        digitalWrite(BUZZER_PIN, LOW);
+        if (i + 1 < cantidad) {
+          vTaskDelay(pdMS_TO_TICKS(PAUSA_PITIDO_MS));
+        }
+      }
       digitalWrite(BUZZER_PIN, LOW);
-      buzzerEncendido = false;
-      cambioBuzzer = ahora;
-      --pitidosPendientes;
     }
-  } else if (ahora - cambioBuzzer >= PAUSA_PITIDO_MS) {
-    digitalWrite(BUZZER_PIN, HIGH);
-    buzzerEncendido = true;
-    cambioBuzzer = ahora;
   }
 }
 
-// -------------------- LED DE AMBAS MAQUINAS --------------------
-void actualizarLeds() {
-  for (int i = 0; i < 2; i++) {
-    EstadoEquipo estado = equipos[i].estado;
-    digitalWrite(LEDS[i][0], estado == LIBRE ? HIGH : LOW);
-    // En PREPARANDO la maquina sigue reservada para la siguiente tanda.
-    digitalWrite(LEDS[i][1], (estado == EN_USO || estado == PREPARANDO) ? HIGH : LOW);
-    digitalWrite(LEDS[i][2], estado == TERMINADO ? HIGH : LOW);
+void prepararBuzzer() {
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  colaPitidos = xQueueCreate(4, sizeof(uint8_t));
+  if (colaPitidos) {
+    if (xTaskCreate(tareaBuzzer, "LR_buzzer", 3072, nullptr, 2, nullptr) != pdPASS) {
+      Serial.println("AVISO: no se pudo crear la tarea del buzzer");
+    }
+  } else {
+    Serial.println("AVISO: no se pudo crear cola del buzzer");
   }
+}
+
+// Eventos sonoros: iniciar=2, finalizar=3, retirar=2.
+// Se usan tareas FreeRTOS: los tiempos no dependen del loop ni del HTTP.
+void iniciarPitidos(uint8_t cantidad) {
+  if (!colaPitidos || cantidad < 1 || cantidad > 3) return;
+  xQueueSend(colaPitidos, &cantidad, 0);
+}
+
+// -------------------- RGB DE AMBAS MAQUINAS --------------------
+// LAVADORA: R -> GPIO19, G -> GPIO18, B sin conectar, GND -> GND.
+// SECADORA: R -> GPIO23, G -> GPIO22, B sin conectar, GND -> GND.
+// Los dos modulos son RGB de catodo comun con resistencias incorporadas.
+// GPIO21 y GPIO13 quedan sin LED conectado (eran los amarillos individuales).
+// Verde = LIBRE; rojo = EN_USO o PREPARANDO;
+// amarillo = TERMINADO (rojo fuerte + verde reducido con PWM).
+// Si el amarillo de la secadora se ve muy verde o muy rojo,
+// ajustar BRILLO_VERDE_AMARILLO_S por separado.
+const uint8_t BRILLO_VERDE_AMARILLO_L = 65;  // Valor que ya probamos con la lavadora.
+const uint8_t BRILLO_VERDE_AMARILLO_S = 65;  // Punto de partida para la secadora.
+
+void actualizarRgb(int pinRojo, int pinVerde, EstadoEquipo estado, uint8_t verdeAmarillo) {
+  if (estado == LIBRE) {
+    analogWrite(pinRojo, 0);
+    analogWrite(pinVerde, 255);
+  } else if (estado == TERMINADO) {
+    analogWrite(pinRojo, 255);
+    analogWrite(pinVerde, verdeAmarillo);
+  } else {  // EN_USO o PREPARANDO: sigue reservada.
+    analogWrite(pinRojo, 255);
+    analogWrite(pinVerde, 0);
+  }
+}
+
+void actualizarLeds() {
+  actualizarRgb(LED_L_ROJO, LED_L_VERDE, equipos[0].estado, BRILLO_VERDE_AMARILLO_L);
+  actualizarRgb(LED_S_ROJO, LED_S_VERDE, equipos[1].estado, BRILLO_VERDE_AMARILLO_S);
+  // Pines de los antiguos LED amarillos sin conexion fisica.
+  digitalWrite(LED_L_AMARILLO, LOW);
+  digitalWrite(LED_S_AMARILLO, LOW);
+}
+
+void probarUnRgb(int pinRojo, int pinVerde, uint8_t verdeAmarillo) {
+  // Rojo
+  analogWrite(pinRojo, 255);
+  analogWrite(pinVerde, 0);
+  delay(400);
+  // Verde
+  analogWrite(pinRojo, 0);
+  analogWrite(pinVerde, 255);
+  delay(400);
+  // Amarillo ajustado: rojo + verde reducido
+  analogWrite(pinRojo, 255);
+  analogWrite(pinVerde, verdeAmarillo);
+  delay(650);
+  analogWrite(pinRojo, 0);
+  analogWrite(pinVerde, 0);
+  delay(150);
 }
 
 void prepararYProbarLeds() {
+  // Mismos GPIO de los LED originales, no se agrega ninguno nuevo.
   for (int i = 0; i < 2; i++) {
     for (int j = 0; j < 3; j++) {
       digitalWrite(LEDS[i][j], LOW);
       pinMode(LEDS[i][j], OUTPUT);
     }
   }
-  for (int i = 0; i < 2; i++) {
-    for (int j = 0; j < 3; j++) {
-      digitalWrite(LEDS[i][j], HIGH);
-      delay(250);
-      digitalWrite(LEDS[i][j], LOW);
-      delay(100);
-    }
-  }
-  actualizarLeds();
+
+  Serial.println("Prueba RGB lavadora: rojo, verde, amarillo");
+  probarUnRgb(LED_L_ROJO, LED_L_VERDE, BRILLO_VERDE_AMARILLO_L);
+  Serial.println("Prueba RGB secadora: rojo, verde, amarillo");
+  probarUnRgb(LED_S_ROJO, LED_S_VERDE, BRILLO_VERDE_AMARILLO_S);
+  actualizarLeds();  // Ambas maquinas comienzan disponibles (verde).
 }
 
 // -------------------- LCD / SERIAL2 A UNO --------------------
@@ -299,11 +353,414 @@ String textoTandas(int m, int idx) {
   return String(colas[m][idx].iniciadas) + "/" + String(colas[m][idx].total);
 }
 
+// -------------------- INTEGRACION API REAL (FastAPI) --------------------
+// IMPORTANTE: habilitar PostgreSQL y app.main:app ANTES de cargar este sketch.
+// Red local compartida desde Windows: la computadora era 192.168.137.1.
+// Cambiar esta IP cuando se use otra red; NO utilizar localhost en el ESP32.
+const bool MODO_API_REAL = true;
+const char* const API_BASE = "http://192.168.137.1:8000";
+// Si LAVARESI_TERMINAL_KEY esta definida en FastAPI, colocar la misma clave
+// SOLO en tu copia local. No publicar claves en GitHub.
+const char* const API_TERMINAL_KEY = "6f3b297aab5c403fbcea892ff5f689b0";
+const unsigned long INTERVALO_API_MS = 1500;  // Lectura asincrona, sin bloquear el LCD.
+const uint8_t MAX_COLA_REMOTA = 12;
+
+struct ItemRemoto {
+  int id = -1;
+  String nombre;
+  String estado;
+  int iniciadas = 0;
+  int total = 0;
+  bool disponible = true;
+};
+struct MaquinaRemota {
+  String estado = "";
+  int segundos = 0;
+  int ocupanteId = -1;
+  String ocupanteNombre = "";
+  int ocupanteIniciadas = 0;
+  int ocupanteTotal = 0;
+  ItemRemoto cola[MAX_COLA_REMOTA];
+  int cantidad = 0;
+};
+struct TurnoCuenta {
+  int id = -1;
+  String estado;
+  int iniciadas = 0;
+  int total = 0;
+  int posicion = 0;
+};
+MaquinaRemota maquinasAPI[2];
+TurnoCuenta turnosCuenta[2];
+String pinCuenta = "";
+String nombreCuenta = "";
+bool apiDisponible = false;
+bool apiSincronizada = false;
+unsigned long ultimaConsultaAPI = 0;
+// Instante del ultimo estado confirmado por el backend (uno por maquina).
+unsigned long sincronizacionMaquinaMs[2] = {0, 0};
+// Evita que un cambio transitorio de API repita la alarma de la misma tanda.
+int ultimoAvisoSolicitud[2] = {-1, -1};
+int ultimoAvisoTanda[2] = {-1, -1};
+// Una tarea separada hace SOLO GET /api/estado. El loop principal
+// procesa el JSON y atiende la LCD, joystick, IR y actualizacion cada segundo.
+SemaphoreHandle_t mutexEstadoHTTP = nullptr;
+String respuestaEstadoPendiente = "";
+int codigoEstadoPendiente = -1;
+bool hayEstadoPendiente = false;
+unsigned long inicioConsultaEstadoPendienteMs = 0;
+unsigned long ultimoCambioConfirmadoMs = 0;
+unsigned long ultimoEstadoCorrectoMs = 0;
+
+
+// Devuelve true solo en HTTP 2xx. No revela el PIN en el monitor serie.
+bool peticionAPI(const String &ruta, const char* metodo, const String &cuerpo,
+                 String &respuesta, int &codigo) {
+  respuesta = "";
+  codigo = -1;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("API %s %s: WiFi desconectado (estado %d)\n",
+                  metodo, ruta.c_str(), (int)WiFi.status());
+    return false;
+  }
+
+  WiFiClient cliente;
+  HTTPClient http;
+  // La API abre transacciones con Neon. Un tiempo de 1.6 s puede ser insuficiente.
+  http.setConnectTimeout(3000);
+  http.setTimeout(8000);
+
+  if (!http.begin(cliente, String(API_BASE) + ruta)) {
+    Serial.printf("API %s %s: no se pudo iniciar HTTP\n", metodo, ruta.c_str());
+    return false;
+  }
+  if (strlen(API_TERMINAL_KEY) > 0 &&
+      (ruta.startsWith("/api/terminal/") || ruta == "/api/estado")) {
+    http.addHeader("X-Terminal-Key", API_TERMINAL_KEY);
+  }
+  if (strcmp(metodo, "POST") == 0) {
+    http.addHeader("Content-Type", "application/json");
+    codigo = http.POST(cuerpo);
+  } else {
+    codigo = http.GET();
+  }
+
+  if (codigo > 0) {
+    respuesta = http.getString();
+    if (ruta != "/api/estado" || codigo != 200) {
+      Serial.printf("API %s %s: HTTP %d, %u bytes\n",
+                    metodo, ruta.c_str(), codigo, (unsigned)respuesta.length());
+    }
+  } else {
+    Serial.printf("API %s %s: error %d (%s)\n",
+                  metodo, ruta.c_str(), codigo,
+                  http.errorToString(codigo).c_str());
+  }
+  http.end();
+  return codigo >= 200 && codigo < 300;
+}
+
+String errorAPI(const String &respuesta, int codigo) {
+  if (codigo <= 0) return "Sin conexion API";
+  JsonDocument datos;
+  if (!deserializeJson(datos, respuesta)) {
+    String detalle = datos["detail"] | "";
+    if (detalle.length()) return detalle;
+  }
+  return "Error HTTP " + String(codigo);
+}
+
+// Si no conocemos el estado real, no mostrar falsamente "disponible".
+void apagarRgbPorConexion() {
+  analogWrite(LED_L_ROJO, 0);
+  analogWrite(LED_L_VERDE, 0);
+  analogWrite(LED_S_ROJO, 0);
+  analogWrite(LED_S_VERDE, 0);
+}
+
+// Las 2 maquinas se consultan en una sola peticion GET /api/estado.
+bool aplicarEstadoAPI(const String &respuesta) {
+  JsonDocument doc;
+  if (deserializeJson(doc, respuesta)) {
+    Serial.println("API: respuesta /api/estado no es JSON valido");
+    apiDisponible = false;
+    apagarRgbPorConexion();
+    return false;
+  }
+  JsonArrayConst lista = doc["maquinas"].as<JsonArrayConst>();
+  if (lista.isNull() || lista.size() != 2) {
+    apiDisponible = false;
+    apagarRgbPorConexion();
+    Serial.println("API: se esperaban 2 maquinas en /api/estado");
+    return false;
+  }
+  // /api/estado puede devolver un resumen PUBLICO (HTTP 200) sin cola.
+  // La terminal debe recibir la vista PRIVADA con X-Terminal-Key.
+  for (JsonObjectConst obj : lista) {
+    if (!obj["cola"].is<JsonArrayConst>()) {
+      Serial.println("API: vista publica. Revise la clave X-Terminal-Key.");
+      apiDisponible = false;
+      apagarRgbPorConexion();
+      return false; // No sobrescribir las colas con listas vacias.
+    }
+  }
+  for (JsonObjectConst obj : lista) {
+    int m = (obj["id"] | 0) - 1;
+    if (m < 0 || m > 1) continue;
+    MaquinaRemota &dest = maquinasAPI[m];
+    EstadoEquipo anterior = equipos[m].estado;
+    dest.estado = String((const char*) (obj["estado"] | ""));
+    dest.segundos = obj["segundos_restantes"] | 0;
+    dest.ocupanteId = -1;
+    dest.ocupanteNombre = "";
+    dest.ocupanteIniciadas = 0;
+    dest.ocupanteTotal = 0;
+    JsonObjectConst ocupante = obj["ocupante"].as<JsonObjectConst>();
+    if (!ocupante.isNull()) {
+      dest.ocupanteId = ocupante["solicitud_id"] | -1;
+      dest.ocupanteNombre = String((const char*)(ocupante["nombre"] | ""));
+      dest.ocupanteIniciadas = ocupante["tandas_iniciadas"] | 0;
+      dest.ocupanteTotal = ocupante["tandas_totales"] | 0;
+    }
+    dest.cantidad = 0;
+    for (JsonObjectConst c : obj["cola"].as<JsonArrayConst>()) {
+      if (dest.cantidad >= MAX_COLA_REMOTA) break;
+      ItemRemoto &item = dest.cola[dest.cantidad++];
+      item.id = c["solicitud_id"] | -1;
+      item.nombre = String((const char*)(c["nombre"] | ""));
+      item.estado = String((const char*)(c["estado"] | ""));
+      item.iniciadas = c["tandas_iniciadas"] | 0;
+      item.total = c["tandas_totales"] | 0;
+      item.disponible = (c["disponible"] | true);
+    }
+    EstadoEquipo nuevo = LIBRE;
+    if (dest.estado == "EN_USO") nuevo = EN_USO;
+    else if (dest.estado == "PENDIENTE_RETIRO") nuevo = TERMINADO;
+    else if (dest.estado == "ENTRE_TANDAS") nuevo = PREPARANDO;
+    equipos[m].estado = nuevo;  // El RGB refleja el backend, no las colas demo.
+    equipos[m].restantes = dest.segundos;
+    sincronizacionMaquinaMs[m] = millis();
+
+    // Una sola alerta de tres pitidos por solicitud/tanda terminada,
+    // aunque la API pierda conexion o devuelva estados transitorios.
+    if (apiSincronizada && anterior == EN_USO && nuevo == TERMINADO &&
+        dest.ocupanteId >= 0 &&
+        (ultimoAvisoSolicitud[m] != dest.ocupanteId ||
+         ultimoAvisoTanda[m] != dest.ocupanteIniciadas)) {
+      ultimoAvisoSolicitud[m] = dest.ocupanteId;
+      ultimoAvisoTanda[m] = dest.ocupanteIniciadas;
+      Serial.printf("AVISO FIN: maquina %d, tanda %d, 3 pitidos (solo una vez)\n",
+                    m + 1, dest.ocupanteIniciadas);
+      iniciarPitidos(3);
+    }
+  }
+  if (!apiSincronizada) Serial.println("API REAL: /api/estado OK - Lavadora y secadora sincronizadas");
+  apiDisponible = true;
+  apiSincronizada = true;
+  ultimoEstadoCorrectoMs = millis();
+  actualizarLeds();
+
+  // Actualizar 'Mi turno' utilizando la cola recibida en la misma solicitud.
+  // Ya no hace falta POST /mi-turno cada 1.5 segundos.
+  for (int m = 0; m < 2; ++m) {
+    if (turnosCuenta[m].id < 0) continue;
+    for (int i = 0; i < maquinasAPI[m].cantidad; ++i) {
+      const ItemRemoto &item = maquinasAPI[m].cola[i];
+      if (item.id == turnosCuenta[m].id) {
+        turnosCuenta[m].estado = item.estado;
+        turnosCuenta[m].iniciadas = item.iniciadas;
+        turnosCuenta[m].total = item.total;
+        turnosCuenta[m].posicion = i + 1;
+        break;
+      }
+    }
+  }
+  return true;
+}
+
+// Recibir una fotografia remota en segundo plano sin bloquear los controles.
+void tareaEstadoHTTP(void *parametro) {
+  for (;;) {
+    if (WiFi.status() == WL_CONNECTED) {
+      String respuesta;
+      int codigo = -1;
+      unsigned long inicioPeticion = millis();
+      peticionAPI("/api/estado", "GET", "", respuesta, codigo);
+      if (mutexEstadoHTTP && xSemaphoreTake(mutexEstadoHTTP, pdMS_TO_TICKS(300)) == pdTRUE) {
+        respuestaEstadoPendiente = respuesta;
+        codigoEstadoPendiente = codigo;
+        inicioConsultaEstadoPendienteMs = inicioPeticion;
+        hayEstadoPendiente = true;
+        xSemaphoreGive(mutexEstadoHTTP);
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(INTERVALO_API_MS));
+  }
+}
+
+void prepararEstadoHTTP() {
+  mutexEstadoHTTP = xSemaphoreCreateMutex();
+  if (!mutexEstadoHTTP) {
+    Serial.println("ERROR: sin memoria para mutex de estado");
+    return;
+  }
+  if (xTaskCreate(tareaEstadoHTTP, "LR_estadoHTTP", 8192, nullptr, 1, nullptr) != pdPASS) {
+    Serial.println("ERROR: no se pudo crear tarea HTTP de estado");
+  }
+}
+
+// Tiempo de visualizacion local: el backend conserva toda la autoridad.
+// Entre consultas de red descontamos visualmente 1 segundo por segundo.
+unsigned long tiempoRestanteVisual(int m) {
+  if (m < 0 || m > 1) return 0UL;
+  const MaquinaRemota &datos = maquinasAPI[m];
+  unsigned long restantes = datos.segundos > 0 ? (unsigned long)datos.segundos : 0UL;
+  if (datos.estado != "EN_USO") return restantes;
+  unsigned long transcurridos = (millis() - sincronizacionMaquinaMs[m]) / 1000UL;
+  return transcurridos >= restantes ? 0UL : restantes - transcurridos;
+}
+
+// Devuelve el codigo y cuerpo al llamador, para distinguir PIN incorrecto,
+// HTTP fallido y JSON invalido. Nunca imprime el PIN ni la clave terminal.
+bool consultarMiTurnoAPI(const String &pin, bool guardar = true,
+                        int *codigoSalida = nullptr, String *respuestaSalida = nullptr) {
+  JsonDocument solicitud;
+  solicitud["pin"] = pin;
+  String cuerpo;
+  serializeJson(solicitud, cuerpo);
+  String respuesta;
+  int codigo;
+  bool exito = peticionAPI("/api/terminal/mi-turno", "POST", cuerpo, respuesta, codigo);
+  if (codigoSalida) *codigoSalida = codigo;
+  if (respuestaSalida) *respuestaSalida = respuesta;
+  if (!exito) {
+    apiDisponible = codigo > 0;
+    Serial.println("API mi-turno: " + errorAPI(respuesta, codigo));
+    return false;
+  }
+
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, respuesta);
+  if (error) {
+    Serial.print("API mi-turno: JSON invalido: ");
+    Serial.println(error.c_str());
+    return false;
+  }
+  if (!guardar) return true;
+  pinCuenta = pin;
+  nombreCuenta = String((const char*)(doc["nombre"] | "Estudiante"));
+  for (int i = 0; i < 2; ++i) turnosCuenta[i] = TurnoCuenta();
+  for (JsonObjectConst s : doc["solicitudes"].as<JsonArrayConst>()) {
+    int m = (s["maquina_id"] | 0) - 1;
+    if (m < 0 || m > 1) continue;
+    turnosCuenta[m].id = s["id"] | -1;
+    turnosCuenta[m].estado = String((const char*)(s["estado"] | ""));
+    turnosCuenta[m].iniciadas = s["tandas_iniciadas"] | 0;
+    turnosCuenta[m].total = s["tandas_totales"] | 0;
+    turnosCuenta[m].posicion = s["posicion"] | 0;
+  }
+  return true;
+}
+
+// Estas funciones solo se usan en modo API y estan declaradas aqui para
+// evitar problemas de prototipos al generar el sketch en Arduino IDE.
+void procesarPinEquipoAPI();
+void procesarPinMiTurnoAPI();
+void registrarTandasAPI();
+void iniciarCicloAPI(unsigned int minutos);
+void revisarAPI();
+
 // -------------------- PANTALLAS --------------------
 const char *opcionesMenu[3] = {"Lavadora", "Secadora", "Consultas"};
 const char *opcionesConsultas[3] = {"Cola Lavadora", "Cola Secadora", "Mi turno"};
 
+void mostrarVistaAPI() {
+  String a, b;
+  switch (pantalla) {
+    case MENU: {
+      int ini = opcionMenu == 0 ? 0 : 1;
+      a = String(opcionMenu == ini ? ">" : " ") + String(ini + 1) + " " + opcionesMenu[ini];
+      b = String(opcionMenu == ini + 1 ? ">" : " ") + String(ini + 2) + " " + opcionesMenu[ini + 1];
+      break;
+    }
+    case EQUIPO: {
+      String sigla = maquina == 0 ? "L" : "S";
+      if (!apiDisponible) { a = sigla + " Sin conexion"; b = "Revise WiFi/API"; break; }
+      MaquinaRemota &e = maquinasAPI[maquina];
+      if (e.estado == "LIBRE") {
+        a = sigla + " Disponible";
+        b = e.cantidad == 0 ? "OK: Ingresar PIN" : "OK: Ver turno";
+      } else if (e.estado == "EN_USO") {
+        a = sigla + " " + e.ocupanteNombre + " " + String(e.ocupanteIniciadas) + "/" + String(e.ocupanteTotal);
+        b = "T: " + formatoTiempo(tiempoRestanteVisual(maquina));
+      } else if (e.estado == "PENDIENTE_RETIRO") {
+        a = sigla + " " + e.ocupanteNombre + " FIN";
+        b = "OK: PIN retiro";
+      } else {
+        a = sigla + " " + e.ocupanteNombre;
+        b = "OK: Sig. tanda";
+      }
+      break;
+    }
+    case PIN_EQUIPO:
+    case PIN_MI_TURNO:
+      a = pantalla == PIN_EQUIPO ? "Ingrese su PIN" : "Mi turno";
+      b = "PIN: "; for (unsigned int i = 0; i < entrada.length(); i++) b += "*";
+      break;
+    case TANDAS:
+      a = "¿Cuántas tandas";
+      b = nombreCuenta + "? " + String(tandasElegidas);
+      break;
+    case TIEMPO: {
+      TurnoCuenta &t = turnosCuenta[maquina];
+      a = String(maquina == 0 ? "L " : "S ") + nombreCuenta + " " + String(t.iniciadas + 1) + "/" + String(t.total);
+      b = "Min: " + (entrada.length() ? entrada : String("--")) + "  OK";
+      break;
+    }
+    case MENU_CONSULTAS: {
+      int ini = opcionConsulta == 0 ? 0 : 1;
+      a = String(opcionConsulta == ini ? ">" : " ") + String(ini + 1) + " " + opcionesConsultas[ini];
+      b = String(opcionConsulta == ini + 1 ? ">" : " ") + String(ini + 2) + " " + opcionesConsultas[ini + 1];
+      break;
+    }
+    case COLA_CONSULTA: {
+      MaquinaRemota &e = maquinasAPI[maquinaConsulta];
+      if (!apiDisponible) { a = "Sin conexion"; b = "Revise el backend"; break; }
+      if (e.cantidad == 0) { a = maquinaConsulta == 0 ? "Cola Lavadora" : "Cola Secadora"; b = "Sin espera"; break; }
+      int idx1 = desplazamientoCola;
+      if (idx1 >= e.cantidad) idx1 = e.cantidad - 1;
+      ItemRemoto &i1 = e.cola[idx1];
+      a = String(idx1 + 1) + " " + i1.nombre + " " + String(i1.iniciadas) + "/" + String(i1.total);
+      int idx2 = idx1 + 1;
+      if (idx2 < e.cantidad) {
+        ItemRemoto &i2 = e.cola[idx2];
+        b = String(idx2 + 1) + " " + i2.nombre + " " + String(i2.iniciadas) + "/" + String(i2.total);
+      } else b = "Fin de cola";
+      break;
+    }
+    case VER_MI_TURNO: {
+      TurnoCuenta &t = turnosCuenta[maquinaConsulta];
+      a = maquinaConsulta == 0 ? "L Mi turno" : "S Mi turno";
+      if (t.id < 0) {
+        b = "Sin solicitud";
+      } else if (maquinasAPI[maquinaConsulta].estado == "PENDIENTE_RETIRO" &&
+                 t.id == maquinasAPI[maquinaConsulta].ocupanteId) {
+        b = "Retirar ropa";  // La solicitud EN_USO sigue activa hasta retirar.
+      } else if (t.estado == "EN_USO") {
+        b = "En uso " + String(t.iniciadas) + "/" + String(t.total);
+      } else {
+        b = "Puesto " + String(t.posicion) + " " + String(t.iniciadas) + "/" + String(t.total);
+      }
+      break;
+    }
+    case AVISO: return;
+  }
+  lcdEnviar(a, b);
+}
+
+
 void mostrarVista() {
+  if (MODO_API_REAL) { mostrarVistaAPI(); return; }
   String a, b;
   switch (pantalla) {
     case MENU: {
@@ -447,8 +904,238 @@ void actualizarAviso() {
   }
 }
 
+// -------------------- OPERACIONES REALES EN FASTAPI --------------------
+void errorOperacionAPI(const String &respuesta, int codigo, Pantalla siguiente) {
+  String detalle = errorAPI(respuesta, codigo);
+  Serial.println("API: " + detalle);
+  // LCD 16x2: mensaje corto; error completo queda en monitor serial.
+  if (codigo == 401 && detalle.indexOf("Terminal") >= 0)
+    avisar("Terminal no", "autorizada", siguiente);
+  else if (codigo == 401)
+    avisar("PIN incorrecto", "Intente otra vez", siguiente);
+  else if (codigo == 409) avisar("No autorizado", "Revise su turno", siguiente);
+  else if (codigo == 429) avisar("Muchos intentos", "Espere 1 minuto", siguiente);
+  else if (codigo <= 0) avisar("Sin conexion", "Revise WiFi/API", siguiente);
+  else avisar("Error servidor", "Ver Monitor", siguiente);
+}
+
+void procesarPinEquipoAPI() {
+  String pin = entrada;
+  entrada = "";
+  if (pin.length() != 4) {
+    avisar("PIN de 4 digitos", "Intente otra vez", PIN_EQUIPO); return;
+  }
+  if (!apiDisponible) {
+    avisar("Sin conexion", "Revise backend", EQUIPO); return;
+  }
+  // Una sola peticion POST: antes se verificaba el mismo PIN dos veces.
+  String respuesta; int codigo = -1;
+  if (!consultarMiTurnoAPI(pin, true, &codigo, &respuesta)) {
+    if (codigo < 200 || codigo >= 300)
+      errorOperacionAPI(respuesta, codigo, PIN_EQUIPO);
+    else
+      avisar("Error JSON", "Revise servidor", PIN_EQUIPO);
+    return;
+  }
+  TurnoCuenta &t = turnosCuenta[maquina];
+  MaquinaRemota &m = maquinasAPI[maquina];
+  if (t.id > 0 && t.id == m.ocupanteId && m.estado == "PENDIENTE_RETIRO") {
+    JsonDocument retirar; retirar["pin"] = pin; retirar["maquina_id"] = maquina + 1;
+    String datos; serializeJson(retirar, datos);
+    if (!peticionAPI("/api/terminal/ciclos/retirar", "POST", datos, respuesta, codigo)) {
+      errorOperacionAPI(respuesta, codigo, EQUIPO); return;
+    }
+    JsonDocument r; deserializeJson(r, respuesta);
+    String resultado = String((const char*)(r["resultado"] | ""));
+    ultimoCambioConfirmadoMs = millis();
+    // La API ya confirmo el retiro: actualizar la LCD y RGB AHORA,
+    // sin esperar 2 consultas adicionales a Neon.
+    iniciarPitidos(2);
+    m.segundos = 0;
+    sincronizacionMaquinaMs[maquina] = millis();
+    if (resultado == "CONTINUAR_TANDAS") {
+      m.estado = "ENTRE_TANDAS";
+      equipos[maquina].estado = PREPARANDO;
+      actualizarLeds();
+      entrada = "";
+      avisar("Tanda retirada", "Sigue otra tanda", TIEMPO, 1450);
+    } else {
+      m.estado = "LIBRE";
+      m.ocupanteId = -1;
+      m.ocupanteNombre = "";
+      equipos[maquina].estado = LIBRE;
+      turnosCuenta[maquina] = TurnoCuenta();
+      actualizarLeds();
+      avisar("Ropa retirada", "Equipo libre", MENU, 1450);
+    }
+    return;
+  }
+  if (t.id < 0) {
+    tandasElegidas = 1;
+    pantalla = TANDAS;
+    mostrarVista();
+  } else if ((m.estado == "LIBRE" && t.estado == "AUTORIZADA") ||
+             (m.estado == "ENTRE_TANDAS" && t.id == m.ocupanteId)) {
+    pedirTiempo();
+  } else if (t.id == m.ocupanteId && m.estado == "EN_USO") {
+    avisar("Ciclo en marcha", "Consulte tiempo", EQUIPO);
+  } else {
+    avisar("Turno registrado", "Puesto: " + String(t.posicion), EQUIPO, 1600);
+  }
+}
+
+void procesarPinMiTurnoAPI() {
+  String pin = entrada; entrada = "";
+  if (pin.length() != 4) { avisar("PIN de 4 digitos", "Intente otra vez", PIN_MI_TURNO); return; }
+  String respuesta; int codigo = -1;
+  if (!consultarMiTurnoAPI(pin, true, &codigo, &respuesta)) {
+    if (codigo < 200 || codigo >= 300)
+      errorOperacionAPI(respuesta, codigo, PIN_MI_TURNO);
+    else
+      avisar("Error JSON", "Revise servidor", PIN_MI_TURNO);
+    return;
+  }
+  // Mostrar primero donde EXISTE la solicitud del estudiante.
+  // Si la secadora tiene ropa por retirar, verla primero.
+  if (turnosCuenta[1].id > 0 &&
+      maquinasAPI[1].estado == "PENDIENTE_RETIRO" &&
+      turnosCuenta[1].id == maquinasAPI[1].ocupanteId) {
+    maquinaConsulta = 1;
+  } else if (turnosCuenta[0].id > 0) {
+    maquinaConsulta = 0;
+  } else if (turnosCuenta[1].id > 0) {
+    maquinaConsulta = 1;
+  } else {
+    maquinaConsulta = 0;
+  }
+  // Arriba = lavadora, abajo = secadora cuando haya turnos en ambas.
+  pantalla = VER_MI_TURNO;
+  mostrarVista();
+}
+
+void registrarTandasAPI() {
+  if (pinCuenta.length() != 4) { avisar("Ingrese su PIN", "Otra vez", EQUIPO); return; }
+  JsonDocument req;
+  req["pin"] = pinCuenta;
+  req["maquina_id"] = maquina + 1; // Backend usa 1 lavadora / 2 secadora.
+  req["tandas"] = tandasElegidas;
+  String cuerpo; serializeJson(req, cuerpo);
+  String respuesta; int codigo;
+  if (!peticionAPI("/api/terminal/solicitudes", "POST", cuerpo, respuesta, codigo)) {
+    errorOperacionAPI(respuesta, codigo, EQUIPO); return;
+  }
+  ultimoCambioConfirmadoMs = millis();
+  // La respuesta del POST trae el turno confirmado; no duplicar consultas.
+  JsonDocument creado;
+  if (deserializeJson(creado, respuesta)) {
+    avisar("Error JSON", "Revise servidor", EQUIPO); return;
+  }
+  TurnoCuenta &t = turnosCuenta[maquina];
+  t.id = creado["id"] | -1;
+  t.estado = String((const char*)(creado["estado"] | ""));
+  t.iniciadas = creado["tandas_iniciadas"] | 0;
+  t.total = creado["tandas_totales"] | 0;
+  t.posicion = creado["posicion"] | 0;
+  if (t.estado == "AUTORIZADA" && maquinasAPI[maquina].estado == "LIBRE") {
+    pedirTiempo();
+  } else {
+    avisar("Turno registrado", "Puesto: " + String(t.posicion), EQUIPO, 1650);
+  }
+}
+
+void iniciarCicloAPI(unsigned int minutos) {
+  if (minutos < 1 || minutos > 180) {
+    entrada = ""; avisar("Tiempo invalido", "Ingrese 1-180", TIEMPO); return;
+  }
+  JsonDocument req;
+  req["pin"] = pinCuenta;
+  req["maquina_id"] = maquina + 1;
+  req["minutos"] = minutos;
+  String cuerpo; serializeJson(req, cuerpo);
+  String respuesta; int codigo;
+  const unsigned long solicitudEnviadaMs = millis();
+  if (!peticionAPI("/api/terminal/ciclos/iniciar", "POST", cuerpo, respuesta, codigo)) {
+    errorOperacionAPI(respuesta, codigo, EQUIPO); return;
+  }
+  // El reloj comienza en el BACKEND al aceptar la solicitud.
+  // Descontar una estimacion del trayecto de ida y respuesta.
+  const unsigned long duracionSeg = (unsigned long)minutos * 60UL;
+  const unsigned long viajeSeg = (millis() - solicitudEnviadaMs) / 1000UL;
+  const unsigned long segundosIniciales = viajeSeg >= duracionSeg ? 0 : duracionSeg - viajeSeg;
+  ultimoCambioConfirmadoMs = millis();
+  // El servidor AUTORIZO el ciclo. Mostrarlo inmediatamente,
+  // sin consumir los primeros segundos en dos solicitudes HTTP extra.
+  TurnoCuenta &t = turnosCuenta[maquina];
+  if (t.id > 0) {
+    t.iniciadas++;
+    t.estado = "EN_USO";
+  }
+  MaquinaRemota &m = maquinasAPI[maquina];
+  m.estado = "EN_USO";
+  m.segundos = segundosIniciales;
+  m.ocupanteId = t.id;
+  m.ocupanteNombre = nombreCuenta;
+  m.ocupanteIniciadas = t.iniciadas;
+  m.ocupanteTotal = t.total;
+  sincronizacionMaquinaMs[maquina] = millis();
+  equipos[maquina].estado = EN_USO;
+  equipos[maquina].restantes = segundosIniciales;
+  actualizarLeds();
+  irEquipo();
+  iniciarPitidos(2);
+}
+
+void revisarAPI() {
+  if (!MODO_API_REAL || !mutexEstadoHTTP) return;
+  String respuesta;
+  int codigo = -1;
+  unsigned long inicioConsulta = 0;
+  bool listo = false;
+  if (xSemaphoreTake(mutexEstadoHTTP, 0) == pdTRUE) {
+    if (hayEstadoPendiente) {
+      respuesta = respuestaEstadoPendiente;
+      codigo = codigoEstadoPendiente;
+      inicioConsulta = inicioConsultaEstadoPendienteMs;
+      hayEstadoPendiente = false;
+      listo = true;
+    }
+    xSemaphoreGive(mutexEstadoHTTP);
+  }
+  if (!listo) {
+    // Incluso si el WiFi se desconecta sin respuesta HTTP, no conservar
+    // indefinidamente un estado de las maquinas que puede ser obsoleto.
+    if (apiDisponible && WiFi.status() != WL_CONNECTED &&
+        millis() - ultimoEstadoCorrectoMs > 12000UL) {
+      apiDisponible = false;
+      apagarRgbPorConexion();
+      if (pantalla == EQUIPO || pantalla == COLA_CONSULTA) mostrarVista();
+    }
+    return;
+  }
+  // Ignorar respuestas cuya solicitud comenzo antes de un POST confirmado.
+  // Evita mostrar LIBRE inmediatamente despues de haber iniciado un ciclo.
+  if (ultimoCambioConfirmadoMs != 0 &&
+      (long)(inicioConsulta - ultimoCambioConfirmadoMs) < 0) return;
+  if (codigo == 200) {
+    if (aplicarEstadoAPI(respuesta)) {
+      if (pantalla == EQUIPO || pantalla == COLA_CONSULTA || pantalla == VER_MI_TURNO)
+        mostrarVista();
+    }
+  } else {
+    Serial.printf("API estado temporalmente no disponible, HTTP %d\n", codigo);
+    // Un error momentaneo NO apaga RGBs ni falsifica estados de maquinas.
+    // Solo tras 12 segundos sin respuesta correcta indicamos desconexion.
+    if (!apiSincronizada || millis() - ultimoEstadoCorrectoMs > 12000UL) {
+      apiDisponible = false;
+      apagarRgbPorConexion();
+      if (pantalla == EQUIPO || pantalla == COLA_CONSULTA) mostrarVista();
+    }
+  }
+}
+
 // -------------------- INICIO Y RETIRO DE TANDAS --------------------
 void iniciarCiclo(unsigned int minutos) {
+  if (MODO_API_REAL) { iniciarCicloAPI(minutos); return; }
   int idx = buscarSolicitud(maquina, usuarioActual);
   if (idx < 0) {
     avisar("Sin solicitud", "Registre turno", EQUIPO);
@@ -474,7 +1161,7 @@ void iniciarCiclo(unsigned int minutos) {
   e.restantes = (unsigned long)minutos * 60UL;
   e.ultimoTick = millis();
   actualizarLeds();
-  iniciarPitidos(1);
+  iniciarPitidos(2);
   Serial.println("Inicio " + etiquetaMaquina(maquina) + " / " + nombreUsuario(usuarioActual) +
                  " / tanda " + textoTandas(maquina, idx));
   irEquipo();
@@ -492,7 +1179,7 @@ void confirmarRetiro(int usuario) {
     return;
   }
   e.restantes = 0;
-  iniciarPitidos(1);
+  iniciarPitidos(2);
   if (colas[maquina][idx].iniciadas < colas[maquina][idx].total) {
     // Tanda intermedia: el dueno retiene la maquina y coloca la siguiente.
     e.estado = PREPARANDO;
@@ -509,6 +1196,7 @@ void confirmarRetiro(int usuario) {
 }
 
 void procesarPinEquipo() {
+  if (MODO_API_REAL) { procesarPinEquipoAPI(); return; }
   int id = -1;
   for (int i = 0; i < NUM_USUARIOS; i++) {
     if (entrada == usuarios[i].pin) { id = i; break; }
@@ -548,6 +1236,7 @@ void procesarPinEquipo() {
 }
 
 void procesarPinMiTurno() {
+  if (MODO_API_REAL) { procesarPinMiTurnoAPI(); return; }
   int id = -1;
   for (int i = 0; i < NUM_USUARIOS; i++) {
     if (entrada == usuarios[i].pin) { id = i; break; }
@@ -565,6 +1254,7 @@ void procesarPinMiTurno() {
 }
 
 void registrarTandas() {
+  if (MODO_API_REAL) { registrarTandasAPI(); return; }
   int idx = agregarSolicitud(maquina, usuarioActual, tandasElegidas);
   if (idx < 0) {
     avisar("Cola completa", "Intente despues", EQUIPO);
@@ -683,7 +1373,7 @@ void seleccionarAbajo() {
     case MENU_CONSULTAS: if (opcionConsulta < 2) ++opcionConsulta; break;
     case TANDAS: if (tandasElegidas > 1) --tandasElegidas; break;
     case COLA_CONSULTA:
-      if (desplazamientoCola + 1 < cantidadCola[maquinaConsulta]) ++desplazamientoCola;
+      if (desplazamientoCola + 1 < (MODO_API_REAL ? maquinasAPI[maquinaConsulta].cantidad : cantidadCola[maquinaConsulta])) ++desplazamientoCola;
       break;
     case VER_MI_TURNO: maquinaConsulta = 1; break;
     default: return;
@@ -778,6 +1468,7 @@ void revisarJoystick() {
 
 // -------------------- DOS TEMPORIZADORES SIMULTANEOS --------------------
 void actualizarCiclos() {
+  if (MODO_API_REAL) return; // Tiempo autoritativo = backend PostgreSQL.
   unsigned long ahora = millis();
   for (int m = 0; m < 2; m++) {
     Equipo &e = equipos[m];
@@ -874,31 +1565,43 @@ void probarConexionBackend() {
 void setup() {
   Serial.begin(115200);
   Serial2.begin(9600, SERIAL_8N1, 16, 17); // Mismo TX17 -> UNO D2.
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
+  prepararBuzzer();
   pinMode(JOY_SW, INPUT_PULLUP);
   analogReadResolution(12);
   prepararYProbarLeds();
+  if (MODO_API_REAL) apagarRgbPorConexion(); // No asumir libres antes de sincronizar.
   IrReceiver.begin(IR_PIN, ENABLE_LED_FEEDBACK);
 
   delay(1200);
-  Serial.println("=== LavaRESI: menu, tandas y consultas DEMO ===");
-  Serial.println("PIN demo: Melissa 1234 | Kelvin 2345 | Andy 3456 | Andrei 4567");
-  Serial.println("Control remoto, joystick, 6 LED, buzzer y dos ciclos independientes.");
+  Serial.println("=== LavaRESI: terminal integrada con FastAPI ===");
+  if (!MODO_API_REAL)
+    Serial.println("Modo demostracion local activado.");
+  Serial.println("Control remoto, joystick, 2 RGB, buzzer y dos ciclos independientes.");
   lcdEnviar("LavaRESI", "Terminal lista");
   delay(1400);
   irMenu();
   iniciarWiFi(); // No esperamos a conectar: el sistema queda operativo.
+  if (MODO_API_REAL) prepararEstadoHTTP();
 }
 
 void loop() {
   actualizarWiFi();
-  actualizarBuzzer();
   actualizarCiclos();
   actualizarAviso();
   revisarControl();
   revisarJoystick();
   revisarSerialDemo();
-  probarConexionBackend();
+  // /api/health solo se usa para diagnosticos manuales, no cada arranque.
+  revisarAPI(); // Consume las respuestas HTTP recibidas en tarea independiente.
+
+  // El tiempo de la LCD se dibuja cada segundo entre consultas HTTP.
+  // lcdEnviar evita retransmitir cuando el texto no ha cambiado.
+  static unsigned long ultimoRefrescoLCD = 0;
+  if (MODO_API_REAL && apiDisponible && pantalla == EQUIPO &&
+      maquinasAPI[maquina].estado == "EN_USO" &&
+      millis() - ultimoRefrescoLCD >= 200UL) {
+    ultimoRefrescoLCD = millis();
+    mostrarVista();
+  }
   delay(20);
 }

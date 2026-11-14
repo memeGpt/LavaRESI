@@ -1,3 +1,4 @@
+
 % LavaRESI - Motor de reglas de turnos (SWI-Prolog)
 % Modelo: 1 lavadora (id 1), 1 secadora (id 2).
 % No modifica la base de datos ni valida PIN: eso corresponde al backend.
@@ -64,7 +65,7 @@ reserva(M, Lista, S) :-
 elegible(M, Lista, S) :-
     solicitudes_ordenadas(Lista, Ordenadas),
     member(S, Ordenadas), solicitud_maquina(M, S),
-    get_dict(estado, S, 'EN_ESPERA'),
+    get_dict(estado, S, E), memberchk(E, ['EN_ESPERA', 'AUTORIZADA']),
     get_dict(disponible, S, 1),
     get_dict(tandas_iniciadas, S, 0), !.
 
@@ -84,12 +85,6 @@ siguiente(D, R) :-
         )
     ; ocupante(M, Lista, _) ->
         R = _{accion:'ESPERAR', motivo:'ESTADO_INCONSISTENTE_OCUPANTE'}
-    ; reserva(M, Lista, Reservada) ->
-        get_dict(id, Reservada, Id),
-        ( get_dict(disponible, Reservada, 1) ->
-            R = _{accion:'AUTORIZAR', solicitud_id:Id, motivo:'RESERVA_EXISTENTE'}
-        ; R = _{accion:'ESPERAR', motivo:'REVISAR_RESERVA_NO_DISPONIBLE'}
-        )
     ; elegible(M, Lista, S) ->
         get_dict(id, S, Id),
         R = _{accion:'AUTORIZAR', solicitud_id:Id, motivo:'PRIMER_DISPONIBLE'}

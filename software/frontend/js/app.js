@@ -1,481 +1,950 @@
 
-const $ = (s) => document.querySelector(s);
+// ==========================================
+// LavaRESI - Frontend
+// Inicio de sesión, turnos y tiempo real
+// ==========================================
 
-const NOMBRE_ESTADO = {
-  LIBRE: "Libre",
-  EN_USO: "En uso",
-  PENDIENTE_RETIRO: "Retirar ropa",
-  ENTRE_TANDAS: "Entre tandas"
-};
+const $ = (id) => document.getElementById(id);
 
-const NOMBRE_MAQUINA = {
+const NOMBRES = {
   LAVADORA: "Lavadora",
   SECADORA: "Secadora"
 };
 
-let estado = null;
-let yo = null;
+const ESTADOS = {
+  LIBRE: ["Libre", "libre"],
+  EN_USO: ["En uso", "en-uso"],
+  PENDIENTE_RETIRO: ["Pendiente de retiro", "pendiente-retiro"],
+  ENTRE_TANDAS: ["Entre tandas", "entre-tandas"]
+};
+
+let cuenta = null;
+let maquinas = [];
+let sesionConsultada = false;
 let refrescando = false;
-let refrescoPendiente = false;
+let otroRefresco = false;
 
-function h(tag, props = {}, ...hijos) {
-  const el = document.createElement(tag);
+let firmaMaquinas = "";
+let firmaTurnos = "";
+let firmaAvisos = "";
 
-  for (const [k, v] of Object.entries(props)) {
-    if (k === "class") {
-      el.className = v;
-    } else if (k.startsWith("on")) {
-      el.addEventListener(k.slice(2), v);
-    } else {
-      el.setAttribute(k, v);
-    }
-  }
+let socket = null;
+let intentosSocket = 0;
 
-  el.append(...hijos.flat().filter((x) => x !== null && x !== undefined));
-  return el;
+// ==========================================
+// FUNCIONES GENERALES
+// ==========================================
+
+function elemento(etiqueta, clase = "", contenido = "") {
+  const e = document.createElement(etiqueta);
+
+  if (clase) e.className = clase;
+
+  e.textContent = contenido;
+  return e;
 }
 
-async function api(ruta, metodo = "GET", cuerpo) {
-  const r = await fetch("/api" + ruta, {
+function mensaje(id, texto, exito = false) {
+  const e = $(id);
+
+  e.textContent = texto;
+  e.className = "mensaje" +
+    (texto ? (exito ? " exito" : " error") : "");
+}
+
+async function api(ruta, metodo = "GET", datos = null) {
+  const respuesta = await fetch("/api" + ruta, {
     method: metodo,
-    headers: cuerpo ? { "Content-Type": "application/json" } : {},
-    body: cuerpo ? JSON.stringify(cuerpo) : undefined
+    credentials: "same-origin",
+    headers: datos === null
+      ? {}
+      : { "Content-Type": "application/json" },
+    body: datos === null
+      ? undefined
+      : JSON.stringify(datos)
   });
 
-  const datos = await r.json().catch(() => ({}));
+  const cuerpo = await respuesta.json().catch(() => ({}));
 
-  if (!r.ok) {
-    const d = datos.detail;
-    throw new Error(
-      typeof d === "string" ? d : "No se pudo completar la solicitud."
+  if (!respuesta.ok) {
+    const error = new Error(
+      typeof cuerpo.detail === "string"
+        ? cuerpo.detail
+        : `Error del servidor (HTTP ${respuesta.status})`
     );
+
+    error.status = respuesta.status;
+    throw error;
   }
 
-  return datos;
+  return cuerpo;
 }
 
-function mostrarMensaje(el, texto, bien = false) {
-  el.textContent = texto;
-  el.className = "mensaje" + (bien ? " bien" : "");
+// ==========================================
+// NAVEGACIÓN
+// ==========================================
+
+function vista(nombre) {
+  $("vista-cuenta").hidden = nombre !== "cuenta";
+  $("vista-estado").hidden = nombre !== "estado";
+
+  document.querySelectorAll(".nav").forEach(b => {
+    b.classList.toggle(
+      "activo",
+      b.dataset.vista === nombre
+    );
+  });
 }
 
-function ponerCarga(boton, cargando, texto = "Procesando...") {
-  if (!boton) return;
+// ==========================================
+// CONTADORES DE LAS MÁQUINAS
+// ==========================================
 
-  if (cargando) {
-    if (boton.dataset.cargando === "true") return;
+function formatoTiempo(segundos) {
+  const t = Math.max(0, Math.ceil(Number(segundos) || 0));
 
-    boton.dataset.textoOriginal = boton.textContent.trim();
-    boton.dataset.cargando = "true";
-    boton.disabled = true;
-    boton.classList.add("cargando");
-    boton.setAttribute("aria-busy", "true");
-    boton.textContent = texto;
-  } else {
-    boton.disabled = false;
-    boton.classList.remove("cargando");
-    boton.removeAttribute("aria-busy");
+  const minutos = Math.floor(t / 60);
+  const segundosRestantes = t % 60;
 
-    if (boton.dataset.textoOriginal !== undefined) {
-      boton.textContent = boton.dataset.textoOriginal;
-      delete boton.dataset.textoOriginal;
+  return (
+    String(minutos).padStart(2, "0") +
+    ":" +
+    String(segundosRestantes).padStart(2, "0")
+  );
+}
+
+// Cuenta localmente cada segundo.
+// No necesita pedir información al backend
+// cada vez que cambia un número.
+
+function avanzarContadores() {
+  document.querySelectorAll("[data-fin]").forEach(nodo => {
+    const restantes =
+      (Number(nodo.dataset.fin) - Date.now()) / 1000;
+
+    const texto = formatoTiempo(restantes);
+
+    if (nodo.textContent !== texto) {
+      nodo.textContent = texto;
     }
-
-    delete boton.dataset.cargando;
-  }
+  });
 }
 
-// ---------------------------------------------------------------- estado público
+setInterval(avanzarContadores, 250);
 
-function mmss(seg) {
-  const m = Math.floor(seg / 60);
-  const s = seg % 60;
-
-  return String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
-}
+// ==========================================
+// TARJETAS DE LAVADORA Y SECADORA
+// ==========================================
 
 function tarjetaMaquina(m) {
-  const detalle = [];
+  const [etiqueta, clase] =
+    ESTADOS[m.estado] || [m.estado, ""];
 
-  if (m.estado === "EN_USO" && m.ocupante) {
-    detalle.push(
-      h(
+  const tarjeta = elemento("article", "maquina");
+  const cabecera = elemento("div", "cabecera-maquina");
+
+  cabecera.append(
+    elemento(
+      "h3",
+      "",
+      NOMBRES[m.tipo] || m.tipo
+    ),
+    elemento(
+      "span",
+      "estado-badge " + clase,
+      etiqueta
+    )
+  );
+
+  tarjeta.append(cabecera);
+
+  // Visitantes: resumen sin nombres.
+  // Usuarios con sesión: cola detallada.
+
+  const privado =
+    cuenta !== null && Array.isArray(m.cola);
+
+  const ocupante = privado ? m.ocupante : null;
+
+  if (m.estado === "EN_USO") {
+    tarjeta.append(
+      elemento(
         "p",
-        {},
-        `${m.ocupante.nombre} · tanda ${m.ocupante.tandas_iniciadas}/${m.ocupante.tandas_totales}`
+        "",
+        ocupante
+          ? `${ocupante.nombre} · tanda ${ocupante.tandas_iniciadas}/${ocupante.tandas_totales}`
+          : "Ciclo en curso"
       )
     );
 
-    if (m.segundos_restantes !== null) {
-      detalle.push(
-        h("p", {
-          class: "cuenta",
-          "data-fin": Date.now() + m.segundos_restantes * 1000
-        }, mmss(m.segundos_restantes))
+    if (
+      m.segundos_restantes !== null &&
+      m.segundos_restantes !== undefined
+    ) {
+      const reloj = elemento(
+        "p",
+        "temporizador",
+        formatoTiempo(m.segundos_restantes)
+      );
+
+      reloj.dataset.fin = String(
+        Date.now() + Number(m.segundos_restantes) * 1000
+      );
+
+      tarjeta.append(reloj);
+    }
+
+  } else if (m.estado === "PENDIENTE_RETIRO") {
+    tarjeta.append(
+      elemento(
+        "p",
+        "suave",
+        ocupante
+          ? `${ocupante.nombre} debe retirar su ropa.`
+          : "Esperando que retiren la ropa."
+      )
+    );
+
+  } else if (m.estado === "ENTRE_TANDAS") {
+    tarjeta.append(
+      elemento(
+        "p",
+        "suave",
+        ocupante
+          ? `${ocupante.nombre} prepara otra tanda.`
+          : "Preparando la siguiente tanda."
+      )
+    );
+
+  } else {
+    tarjeta.append(
+      elemento(
+        "p",
+        "suave",
+        "Disponible para el siguiente turno."
+      )
+    );
+  }
+
+  // ========================================
+  // LISTAS DE ESPERA
+  // ========================================
+
+  const lista = elemento("div", "lista-cola");
+
+  if (!privado) {
+    const total = m.personas_en_espera ??
+      (
+        Array.isArray(m.cola)
+          ? m.cola.filter(
+            s => s.estado !== "EN_USO"
+          ).length
+          : null
+      );
+
+    lista.append(
+      elemento(
+        "div",
+        "sin-espera",
+        total === null
+          ? "Iniciá sesión para ver la lista."
+          : `${total} ${total === 1
+            ? "persona en espera"
+            : "personas en espera"
+          }. Iniciá sesión para ver los nombres.`
+      )
+    );
+
+  } else {
+    const espera = m.cola.filter(
+      s => s.estado !== "EN_USO"
+    );
+
+    if (!espera.length) {
+      lista.append(
+        elemento(
+          "div",
+          "sin-espera",
+          "Sin personas en espera"
+        )
       );
     }
-  } else if (m.estado === "PENDIENTE_RETIRO" && m.ocupante) {
-    detalle.push(
-      h("p", {}, `${m.ocupante.nombre} debe retirar su ropa en la terminal.`)
-    );
-  } else if (m.estado === "ENTRE_TANDAS" && m.ocupante) {
-    detalle.push(
-      h("p", {}, `${m.ocupante.nombre} prepara su siguiente tanda.`)
-    );
-  } else {
-    detalle.push(
-      h("p", { class: "suave" }, "Disponible para el siguiente turno.")
-    );
+
+    espera.forEach(s => {
+      const fila = elemento("div", "fila-cola");
+
+      fila.append(
+        elemento(
+          "span",
+          "",
+          `${s.posicion}. ${s.nombre} · ${s.tandas_totales
+          } ${s.tandas_totales === 1
+            ? "tanda"
+            : "tandas"
+          }`
+        )
+      );
+
+      const texto = !s.disponible
+        ? "Ausente"
+        : s.estado === "AUTORIZADA"
+          ? "Siguiente"
+          : "En espera";
+
+      fila.append(
+        elemento("span", "pequeno", texto)
+      );
+
+      lista.append(fila);
+    });
   }
 
-  const espera = m.cola.filter((c) => c.estado !== "EN_USO");
+  tarjeta.append(lista);
 
-  const cola = h(
-    "ul",
-    { class: "cola" },
-    espera.length
-      ? espera.map((c) =>
-          h(
-            "li",
-            {},
-            h(
-              "span",
-              {},
-              `${c.posicion}. ${c.nombre} · ${c.tandas_totales} ${
-                c.tandas_totales === 1 ? "tanda" : "tandas"
-              }`
-            ),
-            c.estado === "AUTORIZADA"
-              ? h("span", { class: "etiqueta turno" }, "Siguiente")
-              : !c.disponible
-                ? h("span", { class: "etiqueta ausente" }, "Ausente")
-                : h("span", { class: "etiqueta" }, "En espera")
+  return tarjeta;
+}
+
+// ==========================================
+// ACTUALIZACIÓN SIN PARPADEOS
+// ==========================================
+
+function pintarMaquinas() {
+  // Excluimos el contador de la comparación.
+  // Así no reconstruimos tarjetas cada segundo.
+
+  const firma = JSON.stringify({
+    privado: cuenta !== null,
+    maquinas: maquinas.map(
+      ({ segundos_restantes, ...otros }) => otros
+    )
+  });
+
+  if (firma !== firmaMaquinas) {
+    $("maquinas").replaceChildren(
+      ...maquinas.map(tarjetaMaquina)
+    );
+
+    firmaMaquinas = firma;
+
+  } else {
+    // Recalibrar el reloj cuando exista desfase.
+
+    $("maquinas")
+      .querySelectorAll(".maquina")
+      .forEach((tarjeta, i) => {
+        const reloj =
+          tarjeta.querySelector("[data-fin]");
+
+        const segundos =
+          maquinas[i]?.segundos_restantes;
+
+        if (
+          !reloj ||
+          segundos === null ||
+          segundos === undefined
+        ) {
+          return;
+        }
+
+        const finServidor =
+          Date.now() + Number(segundos) * 1000;
+
+        if (
+          Math.abs(
+            Number(reloj.dataset.fin) - finServidor
+          ) > 2000
+        ) {
+          reloj.dataset.fin = String(finServidor);
+        }
+      });
+  }
+
+  $("actualizado").textContent =
+    "Actualizado: " +
+    new Date().toLocaleTimeString("es-CR");
+}
+
+// ==========================================
+// ACCIONES DE LOS TURNOS
+// ==========================================
+
+function botonAccion(texto, accion) {
+  const boton = elemento(
+    "button",
+    "secundario",
+    texto
+  );
+
+  boton.type = "button";
+
+  boton.addEventListener("click", async () => {
+    boton.disabled = true;
+    mensaje("msg-turno", "");
+
+    try {
+      await accion();
+      await refrescar();
+
+    } catch (e) {
+      mensaje("msg-turno", e.message);
+
+    } finally {
+      boton.disabled = false;
+    }
+  });
+
+  return boton;
+}
+
+// ==========================================
+// MIS TURNOS
+// ==========================================
+
+function pintarTurnos() {
+  if (!cuenta) return;
+
+  const firma = JSON.stringify({
+    turnos: cuenta.solicitudes,
+    estados: maquinas.map(
+      m => [m.id, m.estado]
+    )
+  });
+
+  if (firma === firmaTurnos) return;
+
+  firmaTurnos = firma;
+
+  const contenedor = $("mis-turnos");
+
+  const tarjetas = (cuenta.solicitudes || []).map(s => {
+    const maq = maquinas.find(
+      m => m.id === s.maquina_id
+    );
+
+    const tarjeta = elemento("div", "turno");
+
+    const titulo = elemento(
+      "strong",
+      "",
+      NOMBRES[s.maquina] || "Máquina"
+    );
+
+    let texto = "";
+
+    if (s.estado === "AUTORIZADA") {
+      texto =
+        "¡Es tu turno! Acercate a la terminal e ingresá tu PIN.";
+
+    } else if (s.estado === "EN_USO") {
+      texto =
+        `En uso · tanda ${s.tandas_iniciadas}/${s.tandas_totales}`;
+
+    } else {
+      texto =
+        `Puesto ${s.posicion} · ${s.tandas_totales} ${s.tandas_totales === 1
+          ? "tanda"
+          : "tandas"
+        }`;
+    }
+
+    tarjeta.append(
+      titulo,
+      elemento("p", "suave", texto)
+    );
+
+    // Cambiar disponibilidad sin perder
+    // el orden original de la solicitud.
+
+    if (
+      s.estado === "EN_ESPERA" ||
+      s.estado === "AUTORIZADA"
+    ) {
+      tarjeta.append(
+        botonAccion(
+          s.disponible
+            ? "Marcarme ausente"
+            : "Ya estoy disponible",
+
+          () => api(
+            `/solicitudes/${s.id}/disponibilidad`,
+            "POST",
+            { disponible: !s.disponible }
           )
         )
-      : [h("li", { class: "suave" }, "Sin personas en espera")]
-  );
+      );
+    }
 
-  return h(
-    "article",
-    { class: "tarjeta tarjeta-maquina" },
-    h(
-      "div",
-      { class: "fila-entre" },
-      h("h3", { style: "margin:0" }, NOMBRE_MAQUINA[m.tipo]),
-      h(
-        "span",
-        { class: "insignia-estado " + m.estado },
-        NOMBRE_ESTADO[m.estado]
-      )
-    ),
-    ...detalle,
-    cola
-  );
-}
+    // No cancelar un ciclo activo.
+    // Entre tandas, el backend decide si
+    // permite terminar el turno.
 
-function pintarEstado() {
-  if (!estado || !Array.isArray(estado.maquinas)) return;
+    if (
+      s.estado !== "EN_USO" ||
+      maq?.estado === "ENTRE_TANDAS"
+    ) {
+      tarjeta.append(
+        botonAccion(
+          s.estado === "EN_USO"
+            ? "Terminar mi turno"
+            : "Cancelar solicitud",
 
-  $("#maquinas").replaceChildren(...estado.maquinas.map(tarjetaMaquina));
-
-  $("#actualizado").textContent =
-    "Actualizado " + new Date().toLocaleTimeString("es-CR");
-}
-
-setInterval(() => {
-  document.querySelectorAll("[data-fin]").forEach((el) => {
-    el.textContent = mmss(
-      Math.max(0, Math.round((Number(el.dataset.fin) - Date.now()) / 1000))
-    );
-  });
-}, 1000);
-
-// ---------------------------------------------------------------- cuenta
-
-function textoSolicitud(s) {
-  if (s.estado === "AUTORIZADA") {
-    return "¡Es tu turno! Ve a la terminal, ingresa tu PIN e inicia el ciclo.";
-  }
-
-  if (s.estado === "EN_USO") {
-    return `En uso · tanda ${s.tandas_iniciadas} de ${s.tandas_totales}`;
-  }
-
-  return `Puesto ${s.posicion} · ${s.tandas_totales} ${
-    s.tandas_totales === 1 ? "tanda" : "tandas"
-  }`;
-}
-
-async function accion(promesa, el, boton = null, texto = "Procesando...") {
-  ponerCarga(boton, true, texto);
-
-  try {
-    await promesa;
-    await refrescar();
-  } catch (e) {
-    mostrarMensaje(el, e.message);
-  } finally {
-    ponerCarga(boton, false);
-  }
-}
-
-function filaTurno(s) {
-  const maquina =
-    estado && estado.maquinas.find((m) => m.id === s.maquina_id);
-
-  const puedeCancelar =
-    s.estado !== "EN_USO" ||
-    (maquina && maquina.estado === "ENTRE_TANDAS");
-
-  const esperando =
-    s.estado === "EN_ESPERA" || s.estado === "AUTORIZADA";
-
-  const acciones = [];
-
-  if (esperando) {
-    acciones.push(
-      h(
-        "button",
-        {
-          class: "secundario",
-          onclick: (e) =>
-            accion(
-              api(`/solicitudes/${s.id}/disponibilidad`, "POST", {
-                disponible: !s.disponible
-              }),
-              $("#msg-turno"),
-              e.currentTarget,
-              "Actualizando..."
-            )
-        },
-        s.disponible ? "Marcarme ausente" : "Ya estoy disponible"
-      )
-    );
-  }
-
-  if (puedeCancelar) {
-    acciones.push(
-      h(
-        "button",
-        {
-          class: "secundario peligro",
-          onclick: (e) =>
-            accion(
-              api(`/solicitudes/${s.id}/cancelar`, "POST"),
-              $("#msg-turno"),
-              e.currentTarget,
-              "Procesando..."
-            )
-        },
-        s.estado === "EN_USO" ? "Terminar mi turno" : "Cancelar"
-      )
-    );
-  }
-
-  return h(
-    "div",
-    { class: "turno" },
-    h(
-      "div",
-      {},
-      h("strong", {}, NOMBRE_MAQUINA[s.maquina]),
-      h("br"),
-      h("span", { class: "suave" }, textoSolicitud(s)),
-      !s.disponible
-        ? h(
-            "span",
-            { class: "etiqueta ausente", style: "margin-left:.5rem" },
-            "Ausente"
+          () => api(
+            `/solicitudes/${s.id}/cancelar`,
+            "POST"
           )
-        : null
-    ),
-    h("div", { class: "acciones" }, acciones)
+        )
+      );
+    }
+
+    return tarjeta;
+  });
+
+  contenedor.replaceChildren(
+    ...(
+      tarjetas.length
+        ? tarjetas
+        : [
+          elemento(
+            "p",
+            "suave",
+            "No tenés solicitudes activas."
+          )
+        ]
+    )
   );
 }
+
+// ==========================================
+// NOTIFICACIONES
+// ==========================================
+
+function pintarAvisos() {
+  if (!cuenta) return;
+
+  const lista = cuenta.notificaciones || [];
+  const firma = JSON.stringify(lista);
+
+  if (firma === firmaAvisos) return;
+
+  firmaAvisos = firma;
+
+  const avisos = lista.length
+    ? lista.map(n => {
+      const item = elemento(
+        "li",
+        n.leida ? "" : "nueva",
+        n.mensaje
+      );
+
+      if (n.fecha) {
+        const valor = String(n.fecha);
+        const normalizado =
+          valor.replace(" ", "T") +
+          (/[zZ]$|[+-]\d{2}:\d{2}$/.test(valor) ? "" : "Z");
+
+        const fecha = new Date(normalizado);
+
+        if (!Number.isNaN(fecha.getTime())) {
+          item.append(
+            elemento(
+              "small",
+              "suave",
+              " · " + fecha.toLocaleString("es-CR")
+            )
+          );
+        }
+      }
+
+      return item;
+    })
+    : [
+      elemento(
+        "li",
+        "suave",
+        "Sin avisos por ahora."
+      )
+    ];
+
+  $("avisos").replaceChildren(...avisos);
+}
+
+// ==========================================
+// PANEL DE USUARIO
+// ==========================================
 
 function pintarCuenta() {
-  const logueado = !!yo;
+  const entro = cuenta !== null;
 
-  $("#auth").hidden = logueado;
-  $("#panel").hidden = !logueado;
+  $("nav-cuenta").textContent =
+    entro ? "Mi cuenta" : "Ingresar";
 
-  const insignia = $("#insignia");
+  $("nav-estado").textContent =
+    entro ? "Máquinas y listas" : "Ver disponibilidad";
 
-  insignia.hidden = !logueado || yo.no_leidas === 0;
+  $("introduccion-acceso").hidden = entro;
+  $("auth").hidden = entro;
+  $("panel").hidden = !entro;
 
-  if (!logueado) return;
+  $("titulo-estado").textContent =
+    entro
+      ? "Estado y listas de espera"
+      : "Disponibilidad actual";
 
-  insignia.textContent = yo.no_leidas;
-  $("#saludo").textContent = "Hola, " + yo.usuario.nombre;
+  $("nota-estado").textContent =
+    entro
+      ? "Consultá los turnos y el estado actualizado de las máquinas."
+      : "Consultá si las máquinas están disponibles. Para ver nombres y pedir turnos, iniciá sesión.";
 
-  $("#mis-turnos").replaceChildren(
-    ...(yo.solicitudes.length
-      ? yo.solicitudes.map(filaTurno)
-      : [h("p", { class: "suave" }, "No tienes turnos activos.")])
-  );
+  $("abrir-acceso").hidden = entro;
 
-  $("#avisos").replaceChildren(
-    ...(yo.notificaciones.length
-      ? yo.notificaciones.map((n) =>
-          h(
-            "li",
-            { class: n.leida ? "" : "nueva" },
-            n.mensaje,
-            h(
-              "time",
-              {},
-              new Date(n.fecha.replace(" ", "T") + "Z").toLocaleString("es-CR")
-            )
-          )
-        )
-      : [h("li", { class: "suave" }, "Sin avisos por ahora.")])
-  );
+  $("insignia").hidden =
+    !entro || !cuenta.no_leidas;
+
+  if (!entro) return;
+
+  $("insignia").textContent =
+    cuenta.no_leidas;
+
+  $("saludo").textContent =
+    "Hola, " + cuenta.usuario.nombre;
+
+  pintarTurnos();
+  pintarAvisos();
 }
 
-// ---------------------------------------------------------------- refresco
+// ==========================================
+// CONSULTAR DATOS DE FASTAPI
+// ==========================================
 
-async function refrescar() {
+async function refrescar(forzarSesion = false) {
   if (refrescando) {
-    refrescoPendiente = true;
+    otroRefresco = true;
     return;
   }
 
   refrescando = true;
 
   try {
-    try {
-      estado = await api("/estado");
-      pintarEstado();
-    } catch (e) {
-      $("#actualizado").textContent = "Sin conexión con el servidor";
+    const consultarSesion =
+      forzarSesion ||
+      !sesionConsultada ||
+      cuenta !== null;
+
+    const [respuestaEstado, respuestaYo] =
+      await Promise.allSettled([
+        api("/estado"),
+
+        consultarSesion
+          ? api("/yo")
+          : Promise.resolve(null)
+      ]);
+
+    if (
+      respuestaYo.status === "fulfilled" &&
+      respuestaYo.value
+    ) {
+      cuenta = respuestaYo.value;
+      sesionConsultada = true;
+
+    } else if (
+      respuestaYo.status === "rejected" &&
+      respuestaYo.reason.status === 401
+    ) {
+      cuenta = null;
+      sesionConsultada = true;
+
+      firmaTurnos = "";
+      firmaAvisos = "";
     }
 
-    try {
-      yo = await api("/yo");
-    } catch (e) {
-      yo = null;
+    if (respuestaEstado.status === "fulfilled") {
+      maquinas =
+        respuestaEstado.value.maquinas || [];
+
+      pintarMaquinas();
+
+    } else {
+      $("actualizado").textContent =
+        "No se pudo conectar con FastAPI.";
     }
 
     pintarCuenta();
 
-    if (estado) pintarEstado();
   } finally {
     refrescando = false;
 
-    if (refrescoPendiente) {
-      refrescoPendiente = false;
+    if (otroRefresco) {
+      otroRefresco = false;
       void refrescar();
     }
   }
 }
 
-// ---------------------------------------------------------------- eventos de navegación
+// ==========================================
+// BOTONES DE NAVEGACIÓN
+// ==========================================
 
-document.querySelectorAll(".nav").forEach((b) =>
-  b.addEventListener("click", () => {
-    document.querySelectorAll(".nav").forEach((x) =>
-      x.classList.toggle("activo", x === b)
-    );
+document.querySelectorAll(".nav").forEach(b => {
+  b.addEventListener(
+    "click",
+    () => vista(b.dataset.vista)
+  );
+});
 
-    $("#vista-estado").hidden = b.dataset.vista !== "estado";
-    $("#vista-cuenta").hidden = b.dataset.vista !== "cuenta";
-  })
+$("vista-previa").addEventListener(
+  "click",
+  () => vista("estado")
 );
 
-document.querySelectorAll(".pestana").forEach((b) =>
-  b.addEventListener("click", () => {
-    document.querySelectorAll(".pestana").forEach((x) =>
-      x.classList.toggle("activo", x === b)
-    );
-
-    $("#form-login").hidden = b.dataset.form !== "login";
-    $("#form-registro").hidden = b.dataset.form !== "registro";
-
-    mostrarMensaje($("#msg-auth"), "");
-  })
+$("abrir-acceso").addEventListener(
+  "click",
+  () => vista("cuenta")
 );
 
-// ---------------------------------------------------------------- formularios
+// ==========================================
+// PESTAÑAS INGRESAR / CREAR CUENTA
+// ==========================================
 
-function enviarForm(form, ruta, msg, alExito) {
-  form.addEventListener("submit", async (e) => {
+document.querySelectorAll(".pestana").forEach(b => {
+  b.addEventListener("click", () => {
+    document.querySelectorAll(".pestana").forEach(x => {
+      x.classList.toggle("activo", x === b);
+    });
+
+    $("form-login").hidden =
+      b.dataset.form !== "login";
+
+    $("form-registro").hidden =
+      b.dataset.form !== "registro";
+
+    mensaje("msg-auth", "");
+  });
+});
+
+// ==========================================
+// FORMULARIOS
+// ==========================================
+
+function conectarFormulario(id, ruta, mensajeId) {
+  const form = $(id);
+
+  form.addEventListener("submit", async e => {
     e.preventDefault();
 
-    if (form.dataset.procesando === "true") return;
+    const boton =
+      form.querySelector('button[type="submit"]');
 
-    const boton = form.querySelector(
-      'button[type="submit"], button:not([type])'
-    );
+    if (boton.disabled) return;
 
-    const textoCarga =
-      ruta === "/solicitudes"
-        ? "Registrando turno..."
-        : ruta === "/auth/registro"
-          ? "Creando cuenta..."
-          : "Ingresando...";
+    boton.disabled = true;
+    mensaje(mensajeId, "");
 
-    form.dataset.procesando = "true";
-    ponerCarga(boton, true, textoCarga);
-    mostrarMensaje(msg, "");
+    const datos =
+      Object.fromEntries(new FormData(form));
 
-    const datos = Object.fromEntries(new FormData(form));
+    if (ruta === "/solicitudes") {
+      datos.maquina_id =
+        Number(datos.maquina_id);
 
-    for (const k of ["maquina_id", "tandas"]) {
-      if (k in datos) datos[k] = Number(datos[k]);
+      datos.tandas =
+        Number(datos.tandas);
     }
 
     try {
       await api(ruta, "POST", datos);
+
+      if (
+        ruta === "/auth/login" ||
+        ruta === "/auth/registro"
+      ) {
+        sesionConsultada = false;
+        firmaMaquinas = "";
+      }
+
       form.reset();
 
-      await refrescar();
-      alExito?.();
+      await refrescar(true);
+
+      if (
+        ruta === "/auth/login" ||
+        ruta === "/auth/registro"
+      ) {
+        vista("estado");
+
+      } else {
+        mensaje(
+          mensajeId,
+          "Turno registrado correctamente.",
+          true
+        );
+      }
+
     } catch (err) {
-      mostrarMensaje(msg, err.message);
+      mensaje(mensajeId, err.message);
+
     } finally {
-      delete form.dataset.procesando;
-      ponerCarga(boton, false);
+      boton.disabled = false;
     }
   });
 }
 
-enviarForm($("#form-login"), "/auth/login", $("#msg-auth"));
-enviarForm($("#form-registro"), "/auth/registro", $("#msg-auth"));
-
-enviarForm(
-  $("#form-turno"),
-  "/solicitudes",
-  $("#msg-turno"),
-  () => mostrarMensaje($("#msg-turno"), "Turno registrado.", true)
+conectarFormulario(
+  "form-login",
+  "/auth/login",
+  "msg-auth"
 );
 
-$("#salir").addEventListener("click", async (e) => {
-  const boton = e.currentTarget;
-  ponerCarga(boton, true, "Cerrando sesión...");
+conectarFormulario(
+  "form-registro",
+  "/auth/registro",
+  "msg-auth"
+);
 
+conectarFormulario(
+  "form-turno",
+  "/solicitudes",
+  "msg-turno"
+);
+
+// ==========================================
+// CERRAR SESIÓN
+// ==========================================
+
+$("salir").addEventListener("click", async () => {
   try {
     await api("/auth/logout", "POST");
-    yo = null;
+
+    cuenta = null;
+    sesionConsultada = true;
+
+    firmaMaquinas = "";
+    firmaTurnos = "";
+    firmaAvisos = "";
+
+    maquinas = [];
+
+    $("maquinas").replaceChildren(
+      elemento(
+        "p",
+        "suave",
+        "Cargando disponibilidad…"
+      )
+    );
+
     pintarCuenta();
+    vista("cuenta");
+
+    await refrescar();
+
   } catch (err) {
-    mostrarMensaje($("#msg-turno"), err.message);
-  } finally {
-    ponerCarga(boton, false);
+    mensaje("msg-turno", err.message);
   }
 });
 
-$("#leer").addEventListener("click", (e) =>
-  accion(
-    api("/notificaciones/leidas", "POST"),
-    $("#msg-turno"),
-    e.currentTarget,
-    "Actualizando..."
-  )
-);
+// ==========================================
+// MARCAR NOTIFICACIONES COMO LEÍDAS
+// ==========================================
 
-// ---------------------------------------------------------------- inicio
+$("leer").addEventListener("click", async () => {
+  try {
+    await api(
+      "/notificaciones/leidas",
+      "POST"
+    );
 
-refrescar();
+    await refrescar();
+
+  } catch (err) {
+    mensaje("msg-turno", err.message);
+  }
+});
+
+// ==========================================
+// WEBSOCKET - ACTUALIZACIONES INMEDIATAS
+// ==========================================
+
+// WebSocket avisa cuando cambian los datos.
+// Después, la página consulta FastAPI usando
+// la sesión del usuario.
+//
+// No se envían PIN ni contraseñas por WebSocket.
+
+function conectarWebSocket() {
+  const protocolo =
+    location.protocol === "https:"
+      ? "wss:"
+      : "ws:";
+
+  socket = new WebSocket(
+    `${protocolo}//${location.host}/ws/estado`
+  );
+
+  socket.onopen = () => {
+    intentosSocket = 0;
+    void refrescar();
+  };
+
+  socket.onmessage = e => {
+    try {
+      const evento = JSON.parse(e.data);
+
+      if (evento.tipo === "actualizar") {
+        void refrescar();
+      }
+
+    } catch (_) {
+      // Ignorar eventos inválidos.
+    }
+  };
+
+  socket.onerror = () => {
+    socket.close();
+  };
+
+  socket.onclose = () => {
+    intentosSocket =
+      Math.min(intentosSocket + 1, 5);
+
+    const espera = Math.min(
+      30000,
+      1000 * 2 ** intentosSocket
+    );
+
+    setTimeout(
+      conectarWebSocket,
+      espera
+    );
+  };
+}
+
+// ==========================================
+// INICIO DEL SISTEMA
+// ==========================================
+
+// Esperar la comprobación de la sesión antes de mostrar la interfaz.
+void refrescar(true).then(() => {
+  vista("cuenta");
+});
+
+// Escuchar cambios del backend.
+conectarWebSocket();
+
+// Respaldo por si se pierde un evento
+// o se desconecta WebSocket.
+
 setInterval(() => {
-  void refrescar();
-}, 5000);
+  if (!document.hidden) {
+    void refrescar();
+  }
+}, 15000);
+
+// Al regresar a la pestaña, actualizar.
+
+document.addEventListener(
+  "visibilitychange",
+  () => {
+    if (!document.hidden) {
+      void refrescar();
+    }
+  }
+);

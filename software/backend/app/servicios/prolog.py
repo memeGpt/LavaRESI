@@ -1,3 +1,4 @@
+
 """Puente con SWI-Prolog. Envía un JSON por stdin y lee la decisión por stdout.
 Si 'swipl' no está instalado, usa un respaldo en Python con las mismas reglas
 para que el sistema siga funcionando (se avisa por log)."""
@@ -39,13 +40,12 @@ def _respaldo(d: dict) -> dict:
             return {"accion": "ESPERAR", "motivo": "MAQUINA_OCUPADA_SIN_TURNO_VALIDO"}
         if ocupante:
             return {"accion": "ESPERAR", "motivo": "ESTADO_INCONSISTENTE_OCUPANTE"}
-        reserva = next((s for s in sol if s["estado"] == "AUTORIZADA"), None)
-        if reserva:
-            if reserva["disponible"] == 1:
-                return {"accion": "AUTORIZAR", "solicitud_id": reserva["id"], "motivo": "RESERVA_EXISTENTE"}
-            return {"accion": "ESPERAR", "motivo": "REVISAR_RESERVA_NO_DISPONIBLE"}
-        elegible = next((s for s in sol if s["estado"] == "EN_ESPERA" and s["disponible"] == 1
-                         and s["tandas_iniciadas"] == 0), None)
+        # La autorización no equivale a haber iniciado una tanda.
+        # Si la persona ausente regresa ANTES de que empiece otro ciclo,
+        # recupera su prioridad por id. Si la máquina está ocupada,
+        # mantenemos arriba el turno activo (resuelto más arriba).
+        elegible = next((s for s in sol if s["estado"] in ("EN_ESPERA", "AUTORIZADA")
+                         and s["disponible"] == 1 and s["tandas_iniciadas"] == 0), None)
         if elegible:
             return {"accion": "AUTORIZAR", "solicitud_id": elegible["id"], "motivo": "PRIMER_DISPONIBLE"}
         return {"accion": "ESPERAR", "motivo": "SIN_SOLICITUDES_DISPONIBLES"}

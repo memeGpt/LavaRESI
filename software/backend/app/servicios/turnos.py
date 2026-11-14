@@ -1,3 +1,4 @@
+
 """Lógica de negocio: usuarios, solicitudes, ciclos y colas.
 PostgreSQL guarda los datos; SWI-Prolog decide a quién le toca (ver prolog.py)."""
 from datetime import datetime, timedelta, timezone
@@ -85,6 +86,13 @@ def asignar_siguiente(conn, maquina_id):
         return
     s = conn.execute("SELECT id, estado, usuario_id FROM solicitudes WHERE id = %s",
                      (r["solicitud_id"],)).fetchone()
+    # Si vuelve un usuario anterior y la máquina aún está LIBRE,
+    # revocar autorizaciones posteriores que no hayan iniciado ciclos.
+    # Los turnos EN_USO nunca se revocan: se conservan hasta retirar
+    # la ropa de la última tanda.
+    conn.execute("""UPDATE solicitudes SET estado = 'EN_ESPERA'
+                    WHERE maquina_id = %s AND estado = 'AUTORIZADA' AND id <> %s""",
+                 (maquina_id, s["id"]))
     if s["estado"] == "EN_ESPERA":
         conn.execute("UPDATE solicitudes SET estado = 'AUTORIZADA' WHERE id = %s", (s["id"],))
         notificar(conn, s["usuario_id"], s["id"],
