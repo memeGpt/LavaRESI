@@ -1,15 +1,38 @@
 #include <Arduino.h>
+
+// Tipos compartidos del programa. Se mantienen aqui para usar un solo archivo .ino.
+enum EstadoEquipo {
+  LIBRE,
+  EN_USO,
+  TERMINADO,
+  PREPARANDO
+};
+
+enum Pantalla {
+  MENU,
+  EQUIPO,
+  PIN_EQUIPO,
+  TANDAS,
+  TIEMPO,
+  MENU_CONSULTAS,
+  COLA_CONSULTA,
+  PIN_MI_TURNO,
+  VER_MI_TURNO,
+  AVISO
+};
 #include <IRremote.hpp>
 #include <HTTPClient.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #include <ArduinoJson.h>  // Biblioteca ArduinoJson 7.x
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 // Config wifi, yo le comparti desde mi compu hacia el esp32, solo le pone sus credenciales
-static const char* const WIFI_SSID = "LaptopMelissa";
-static const char* const WIFI_PASSWORD = "19732002";
+static const char* const WIFI_SSID = "VICTUS 8514";
+static const char* const WIFI_PASSWORD = "Garcia8500";
 
 // LavaRESI - integracion real ESP32 <-> FastAPI. Backend = fuente unica de turnos.
 // Ajustes: colas privadas, Mi turno en ambas maquinas, buzzer por tarea y LCD sin bloqueo.
@@ -72,7 +95,6 @@ struct Solicitud {
 Solicitud colas[2][MAX_SOLICITUDES];
 uint8_t cantidadCola[2] = {0, 0};
 
-enum EstadoEquipo { LIBRE, EN_USO, TERMINADO, PREPARANDO };
 struct Equipo {
   EstadoEquipo estado = LIBRE;
   int dueno = -1;   // Indice de la cuenta propietaria del turno actual.
@@ -81,18 +103,6 @@ struct Equipo {
 };
 Equipo equipos[2]; // 0 lavadora; 1 secadora.
 
-enum Pantalla {
-  MENU,
-  EQUIPO,
-  PIN_EQUIPO,
-  TANDAS,
-  TIEMPO,
-  MENU_CONSULTAS,
-  COLA_CONSULTA,
-  PIN_MI_TURNO,
-  VER_MI_TURNO,
-  AVISO
-};
 Pantalla pantalla = MENU;
 Pantalla despuesAviso = MENU;
 unsigned long avisoHasta = 0;
@@ -358,11 +368,12 @@ String textoTandas(int m, int idx) {
 // Red local compartida desde Windows: la computadora era 192.168.137.1.
 // Cambiar esta IP cuando se use otra red; NO utilizar localhost en el ESP32.
 const bool MODO_API_REAL = true;
-const char* const API_BASE = "http://192.168.137.1:8000";
+// const char* const API_BASE = "http://192.168.137.1:8000";
+const char* const API_BASE = "https://lavaresi.onrender.com";
 // Si LAVARESI_TERMINAL_KEY esta definida en FastAPI, colocar la misma clave
 // SOLO en tu copia local. No publicar claves en GitHub.
 const char* const API_TERMINAL_KEY = "6f3b297aab5c403fbcea892ff5f689b0";
-const unsigned long INTERVALO_API_MS = 1500;  // Lectura asincrona, sin bloquear el LCD.
+const unsigned long INTERVALO_API_MS = 2000;  // Lectura asincrona, sin bloquear el LCD.
 const uint8_t MAX_COLA_REMOTA = 12;
 
 struct ItemRemoto {
@@ -412,8 +423,16 @@ unsigned long inicioConsultaEstadoPendienteMs = 0;
 unsigned long ultimoCambioConfirmadoMs = 0;
 unsigned long ultimoEstadoCorrectoMs = 0;
 
+// Uno para el estado (se mantiene abierto para ir rápido) y otro para las
+// operaciones (se cierra al terminar para liberar memoria).
+static WiFiClientSecure clienteEstadoSeguro;
+static WiFiClientSecure clienteOperacionSeguro;
 
-// Devuelve true solo en HTTP 2xx. No revela el PIN en el monitor serie.
+void prepararClientesSeguros() {
+  // Cifra la conexión sin validar el certificado del servidor.
+  clienteEstadoSeguro.setInsecure();
+  clienteOperacionSeguro.setInsecure();
+}
 bool peticionAPI(const String &ruta, const char* metodo, const String &cuerpo,
                  String &respuesta, int &codigo) {
   respuesta = "";
@@ -424,18 +443,20 @@ bool peticionAPI(const String &ruta, const char* metodo, const String &cuerpo,
     return false;
   }
 
-  WiFiClient cliente;
+  const bool esEstado = (ruta == "/api/estado");
+  WiFiClientSecure &cliente = esEstado ? clienteEstadoSeguro : clienteOperacionSeguro;
+
   HTTPClient http;
-  // La API abre transacciones con Neon. Un tiempo de 1.6 s puede ser insuficiente.
-  http.setConnectTimeout(3000);
-  http.setTimeout(8000);
+  http.setReuse(esEstado);        // El estado reutiliza la conexión; las operaciones la cierran.
+  http.setConnectTimeout(30000);  // Render puede tardar en despertar tras inactividad.
+  http.setTimeout(60000);
 
   if (!http.begin(cliente, String(API_BASE) + ruta)) {
     Serial.printf("API %s %s: no se pudo iniciar HTTP\n", metodo, ruta.c_str());
     return false;
   }
   if (strlen(API_TERMINAL_KEY) > 0 &&
-      (ruta.startsWith("/api/terminal/") || ruta == "/api/estado")) {
+      (ruta.startsWith("/api/terminal/") || esEstado)) {
     http.addHeader("X-Terminal-Key", API_TERMINAL_KEY);
   }
   if (strcmp(metodo, "POST") == 0) {
@@ -447,7 +468,7 @@ bool peticionAPI(const String &ruta, const char* metodo, const String &cuerpo,
 
   if (codigo > 0) {
     respuesta = http.getString();
-    if (ruta != "/api/estado" || codigo != 200) {
+    if (!esEstado || codigo != 200) {
       Serial.printf("API %s %s: HTTP %d, %u bytes\n",
                     metodo, ruta.c_str(), codigo, (unsigned)respuesta.length());
     }
@@ -455,6 +476,7 @@ bool peticionAPI(const String &ruta, const char* metodo, const String &cuerpo,
     Serial.printf("API %s %s: error %d (%s)\n",
                   metodo, ruta.c_str(), codigo,
                   http.errorToString(codigo).c_str());
+    cliente.stop();               // Reiniciar la conexión si falló.
   }
   http.end();
   return codigo >= 200 && codigo < 300;
@@ -604,7 +626,7 @@ void prepararEstadoHTTP() {
     Serial.println("ERROR: sin memoria para mutex de estado");
     return;
   }
-  if (xTaskCreate(tareaEstadoHTTP, "LR_estadoHTTP", 8192, nullptr, 1, nullptr) != pdPASS) {
+  if (xTaskCreate(tareaEstadoHTTP, "LR_estadoHTTP", 16384, nullptr, 1, nullptr) != pdPASS) {
     Serial.println("ERROR: no se pudo crear tarea HTTP de estado");
   }
 }
@@ -1523,7 +1545,7 @@ void revisarSerialDemo() {
   }
 }
 
-const char* URL_BACKEND = "http://192.168.137.1:8000/api/health";
+const char* URL_BACKEND = "https://lavaresi.onrender.com/api/health";
 bool pruebaBackendRealizada = false;
 
 void probarConexionBackend() {
@@ -1533,11 +1555,12 @@ void probarConexionBackend() {
 
   pruebaBackendRealizada = true;
 
-  WiFiClient cliente;
+  WiFiClientSecure cliente;
+  cliente.setInsecure(); // Igual que las peticiones principales; validar certificado en producción.
   HTTPClient http;
 
-  http.setConnectTimeout(1500);
-  http.setTimeout(1500);
+  http.setConnectTimeout(30000);
+  http.setTimeout(60000);
 
   if (!http.begin(cliente, URL_BACKEND)) {
     Serial.println("No se pudo iniciar la solicitud HTTP");
@@ -1569,6 +1592,7 @@ void setup() {
   pinMode(JOY_SW, INPUT_PULLUP);
   analogReadResolution(12);
   prepararYProbarLeds();
+  prepararClientesSeguros();
   if (MODO_API_REAL) apagarRgbPorConexion(); // No asumir libres antes de sincronizar.
   IrReceiver.begin(IR_PIN, ENABLE_LED_FEEDBACK);
 
